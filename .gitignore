@@ -1,0 +1,47 @@
+# -----------------------------
+# VS Code project settings
+.vscode/
+
+# -----------------------------
+# Python virtual environments
+env/
+.venv/
+venv/
+ENV/
+env.bak/
+*.env
+
+# -----------------------------
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# -----------------------------
+# Test and coverage
+.pytest_cache/
+.coverage
+.tox/
+.nox/
+
+# -----------------------------
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# -----------------------------
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# -----------------------------
+# macOS & Linux user junk
+.DS_Store
+*.swp
+*.swo
+
+# -----------------------------
+# Logs
+*.log
