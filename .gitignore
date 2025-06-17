@@ -11,6 +11,8 @@ ENV/
 env.bak/
 *.env
 
+.env
+
 # -----------------------------
 # Bytecode and cache
 __pycache__/
