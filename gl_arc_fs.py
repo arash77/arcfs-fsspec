@@ -7,9 +7,9 @@ from pathlib import Path
 from itertools import chain
 from dotenv import load_dotenv
 import os
-import hashlib
 from aiofiles import open as aio_open  # async file access
-from utils import split_first, get_repo_name_from_path, split_base_url
+from gitlab_client import GitLabClient  
+from utils import split_first, get_repo_name_from_path, split_base_url, calculate_sha256
 
 
 
@@ -28,6 +28,25 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         self.per_page = kwargs.get("per_page", 100)
         self.use_cache = kwargs.get("use_cache", True)
         self._cache_type = "dir"
+        self.gitlab_client = GitLabClient(base_url=base_url, token=kwargs.get("token", None))
+
+    async def close(self):
+        await self.gitlab_client.close()
+    
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+
+    def __del__(self):
+        if self._session and not self._session.closed:
+            import warnings
+            warnings.warn(
+                "GitLabClient session was not properly closed. "
+                "Call `await client.close()` or use `async with`.",
+                ResourceWarning,
+            )
 
     async def _set_session(self):
         if self._session is None:
@@ -50,9 +69,9 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         # Fetch root-level or project-level if not cached
         if not refresh or path not in self.dircache:
             if path == "":
-                await self._retrieve_root_level()
+                await self._update_root_dir()
             else:
-                await self._retrieve_project_level(path)
+                await self._update_project_dir(path)
 
         listing = self.dircache.get(path, [])
         return listing if detail else [d["name"] for d in listing]
@@ -62,7 +81,7 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         Get information about a file or directory in the GitLab repository.
         """
         if path == "" and path not in self.dircache:
-            await self._retrieve_root_level()
+            await self._update_root_dir()
             return self.dircache[""]
         elif path == "":
             return self.dircache[""]
@@ -75,7 +94,7 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         # there. Could potentially save some requests.
         if repo_path not in self.dircache:
             # If the path is not in the cache, retrieve it.
-            await self._retrieve_project_level(repo_path)
+            await self._update_project_dir(repo_path)
         info = self.dircache.get(repo_path, None)
         if info is None:
             # If the path is still not found, raise an error.
@@ -115,7 +134,7 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         _, inside_path = split_first(rpath)
 
         if id is None:
-            await self._retrieve_root_level()
+            await self._update_root_dir()
             id = self._repo_lookup.get(repo_name, {}).get("id", None)
         if id is None:
             # If the ID is still not found, raise an error.
@@ -164,46 +183,43 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         except FileNotFoundError:
             return False
 
-    async def _retrieve_project_level(self, path):
+    async def _update_root_dir(self):
         """
-        List the contents of a path in the GitLab repository using keyset pagination.
+        Update the root directory cache by retrieving the root level projects.
+        Also updates the _repo_lookup dictionary with project metadata.
+        This is called when the root directory is accessed and not cached.
         """
-        await self._set_session()
-        # Ensure self._session is set
-        if self._session is None:
-            raise RuntimeError("aiohttp session was not initialized")
+        projects = await self.gitlab_client.retrieve_root_level()
+
+        if not self.dircache.get("", None):
+            self.dircache[""] = []
+        for entry in projects:
+            # entry = {"name", "id", "original_path", ...}
+            self.dircache[""].append({
+                "name": entry["name"],
+                "type": "dir",
+                "size": None,
+                "is_project": True,
+            })
+            self._repo_lookup[entry["name"]] = {
+                "id": entry["id"],
+                "original_path": entry["original_path"],
+                "readable_path": entry["readable_path"]
+            } 
+
+    async def _update_project_dir(self, path):
         id = self._repo_lookup.get(path, {}).get("id", None)
         if id is None:
-            await self._retrieve_root_level()
+            await self._update_root_dir()
             id = self._repo_lookup.get(path, {}).get("id", None)
         if id is None:
             # If the ID is still not found, raise an error.
             raise ValueError(
                 f"Project ID for path '{path}' not found in repository lookup."
             )
-        api_url = f"{self._base_url}/api/v4/projects/{id}/repository/tree"
-        params = {
-            "per_page": self.per_page,
-            "pagination": "keyset",
-            "recursive": "True",
-        }
+        files = await self.gitlab_client.retrieve_project_level(path, id, self.per_page)
 
-        all_files = []
-        next_page = True
-        while next_page:
-            async with self._session.get(api_url, params=params) as resp:
-                if resp.status != 200:
-                    raise Exception(f"GitLab API error: {resp.status}")
-                page = await resp.json()
-                all_files.extend(page)
-
-                # Retrieve the next page token from the response headers
-                next_page = resp.links.get("next", {}).get("url")
-                if not next_page:
-                    continue
-                api_url = next_page  # Update the URL for the next request
-
-        for file in all_files:
+        for file in files:
             file_path = str(Path(path, file["path"]))
             # Add each directory in dircache
             if file["type"] == "tree":
@@ -222,76 +238,6 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
             # Add the file to the parent directory's cache
             self.dircache[parent_path].append(val)
 
-        print("teschd")
-        return self.dircache.get(path, [])
-
-    async def _retrieve_root_level(self, per_page=100, page=1):
-        """ """
-        await self._set_session()
-        # Ensure self._session is set
-        if self._session is None:
-            raise RuntimeError("aiohttp session was not initialized")
-
-        # Fetch the first page of projects
-        api_url = f"{self._base_url}/api/v4/projects"
-        params = {
-            "per_page": per_page,
-            "page": page,
-            "simple": "True",
-            "order_by": "last_activity_at",
-            "sort": "desc",
-        }
-        async with self._session.get(api_url, params=params) as resp:
-            if resp.status != 200:
-                raise Exception(f"GitLab API error: {resp.status}")
-            first_page = await resp.json()
-
-            # Get total pages from headers
-            total_pages = int(resp.headers.get("X-Total-Pages", 1))
-
-        # fetch remaining pages
-        # NOTE: This could be factored out and used for root and project level,
-        # with params as argument.
-        async def fetch_page(page):
-            # Ensure self._session is set
-            await self._set_session()
-            if self._session is None:
-                raise RuntimeError("aiohttp session was not initialized")
-            async with self._session.get(
-                api_url,
-                params={
-                    "per_page": per_page,
-                    "page": page,
-                    "simple": "True",
-                    "order_by": "last_activity_at",
-                    "sort": "desc",
-                },
-            ) as r:
-                return await r.json()
-
-        tasks = [fetch_page(page) for page in range(2, total_pages + 1)]
-        remaining_pages = await asyncio.gather(*tasks)
-
-        if not self.dircache.get("", None):
-            self.dircache[""] = []
-        for project in chain(first_page, *remaining_pages):
-            val = {
-                "name": project.get("path_with_namespace").replace("/", "-"),
-                "type": "dir",
-                "size": None,
-                "is_project": True,
-            }
-
-            self.dircache[""].append(val)
-            repo_entry = {
-                "id": project.get("id"),
-                "original_path": project.get("path_with_namespace"),
-                "readable_path": project.get("name_with_namespace"),
-            }
-            self._repo_lookup[val["name"]] = repo_entry
-
-        return self.dircache.get("", [])
-
     async def _upload_lfs_file_async(self, local_path: str, file_size: int, ref: str, url: str) -> str:
         """
         Upload a file to GitLab via the LFS Batch API (async version).
@@ -307,17 +253,10 @@ class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
         await self._set_session()
         if self._session is None:
             raise RuntimeError("aiohttp session was not initialized")
-
+        
         # Step 1: Compute SHA-256 OID
-        sha256 = hashlib.sha256()
-        async with aio_open(local_path, "rb") as f:
-            while True:
-                chunk = await f.read(8192)
-                if not chunk:
-                    break
-                sha256.update(chunk)
-        oid = sha256.hexdigest()
-
+        oid = await calculate_sha256(local_path)
+    
         # Step 2: Prepare LFS batch request
         lfs_payload = {
             "operation": "upload",
@@ -380,7 +319,9 @@ if __name__ == "__main__":
         teschd = GitLab_ARC_FileSystem(base_url=base_url, token=token)
         # result = await teschd._retrieve_root_level(per_page=100)
         # res = await teschd._retrieve_project_level("usadellab-Barvista_ARC")
-        # res = await teschd._ls("usadellab-Barvista_ARC", detail=False)
+        res = await teschd._ls("", detail=False)
+        res = await teschd._ls("usadellab-Barvista_ARC", detail=False)
+        print(res)
         # print(res)
         #await teschd._get_file("usadellab-Barvista_ARC/README.md", "README.md")
         #print(await teschd._exists("usadellab-Barvista_ARC/README.md"))
@@ -389,7 +330,7 @@ if __name__ == "__main__":
         #print(await teschd._isfile("usadellab-Barvista_ARC/README.md"))
         #print(await teschd._info("usadellab-Barvista_ARC/README.md"))
 
-        bala = teschd.ls("usadellab-Barvista_ARC", detail=True)
-        print(bala)
+        #bala = teschd.ls("usadellab-Barvista_ARC", detail=True)
+        await teschd.close()
 
     asyncio.run(main())
