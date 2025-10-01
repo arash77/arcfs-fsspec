@@ -1,313 +1,382 @@
 import fsspec
 import fsspec.asyn
-import aiohttp
 import asyncio
-from urllib.parse import quote
-from pathlib import Path
-from itertools import chain
+from pathlib import Path, PurePosixPath
 from dotenv import load_dotenv
 import os
-from aiofiles import open as aio_open  # async file access
-from gitlab_client import GitLabClient  
-from utils import split_first, get_repo_name_from_path, split_base_url, calculate_sha256
-
+from async_lfs_file import AsyncLFSFile
+from fsspec.asyn import AbstractAsyncStreamedFile
+from utils import split_first
+from gitlab_client import GitLabClient
 
 
 class GitLab_ARC_FileSystem(fsspec.asyn.AsyncFileSystem):
     """
-    GitLab ARC File System
+    Async GitLab-backed filesystem with Git-LFS support.
+    ----------
+
+    Internals
+    ---------
+    • **Direct-path seeding**: address a repo and subpaths without listing root.
+    • **Dual-path querying**: use either canonical `group/sub/repo/...` or a
+      collision-free flat key using `sep` (default `'::'`):
+      `group::sub::repo/...`.
+    • `dircache` stores *only* the flat key form. Two-way maps allow lookups.
     """
 
     def __init__(self, base_url, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._base_url = base_url
-        self._session = None
-        self._repo_lookup = {}
-        self.token = kwargs.get("token", None)
+        self._base_url = base_url.rstrip("/")
+        self.token = kwargs.get("token")
         self.semaphore = asyncio.Semaphore(kwargs.get("semaphore", 25))
         self.per_page = kwargs.get("per_page", 100)
         self.use_cache = kwargs.get("use_cache", True)
         self._cache_type = "dir"
-        self.gitlab_client = GitLabClient(base_url=base_url, token=kwargs.get("token", None))
+        self.gitlab_client = GitLabClient(base_url=base_url, token=self.token)
 
+        # A GitLab-illegal separator for flattening path segments
+        self.sep: str = kwargs.get("sep", "::")
+
+        # Mapping tables
+        self._repo_by_flat: dict[str, dict] = {}     # flat -> {id, original_path, readable_path}
+        self._flat_by_original: dict[str, str] = {}  # original_path -> flat
+        self._flat_by_id: dict[int, str] = {}        # id -> flat
+
+    # ─────────────────────────────── helpers ────────────────────────────────
+
+    def _norm_inside(self, inside: str | None) -> str:
+        """
+        Normalize an 'inside-repo' path for cache keys and API calls:
+        - "", ".", "./"  → ""
+        - "a/./b"        → "a/b"
+        - removes redundant slashes; keeps relative posix semantics
+        """
+        if not inside:
+            return ""
+        norm = str(PurePosixPath(inside))
+        return "" if norm == "." else norm
+
+    def _flatten_repo(self, original_path: str) -> str:
+        """
+        Convert a GitLab project path to a flattened, filesystem-safe key.
+        NOTE: Only call this for projects / repositories, not subpaths!
+
+        The function replaces all "/" in ``original_path`` with ``self.sep`` to
+        produce a single-segment name used in the flattened namespace. 
+
+        Args:
+            original_path: The canonical GitLab path of the project
+                (e.g., "group/subgroup/repo").
+
+        Returns:
+            A flattened repository key (string) suitable for use as a top-level
+            directory name in the virtual filesystem. 
+
+        """
+        return original_path.replace("/", self.sep)
+
+
+    def _register_repo(self, *, project_id: int, original_path: str, readable_path="") -> str:
+        """
+        Register a project in flat-name maps, returning its flat key.
+
+        Args:
+            project_id (int): Numeric GitLab project ID.
+            original_path (str): Canonical GitLab path (e.g., "group/sub/repo").
+            readable_path (str): Human-friendly path to show in UIs. (Optional)
+
+        Returns:
+            str: The flattened repository key added to the mappings.
+        """
+        flat = self._flatten_repo(original_path)
+        existing = self._repo_by_flat.get(flat)
+        if existing:
+            # invariant: same flat must map to same id
+            if existing["id"] != project_id:
+                raise ValueError(f"flat '{flat}' already bound to id {existing['id']}, got {project_id}")
+            return flat  # idempotent: maps already correct
+
+        # first registration: update maps only
+        self._repo_by_flat[flat] = {
+            "id": project_id,
+            "original_path": original_path,
+            "readable_path": readable_path,
+        }
+        self._flat_by_original[original_path] = flat
+        self._flat_by_id[project_id] = flat
+        return flat
+
+    async def _ensure_repo_registered_flat(self, flat_key: str) -> dict:
+        # already known
+        repo = self._repo_by_flat.get(flat_key)
+        if repo:
+            return {**repo, "flat": flat_key}
+
+        # reconstruct canonical path and resolve by path
+        original = flat_key.replace(self.sep, "/")
+        proj = await self.gitlab_client.get_project_by_path(original)
+        if proj is None:
+            raise FileNotFoundError(
+                f"Unknown repository key '{flat_key}'. Use canonical 'group/sub/repo' "
+                f"or provide the correct flat key using '{self.sep}'."
+            )
+        flat = self._register_repo( 
+            project_id=proj["id"],
+            original_path=proj["original_path"],
+            readable_path=proj["readable_path"],
+        )
+        return {**self._repo_by_flat[flat], "flat": flat}
+    
+    async def _update_root_dir(self, *, refresh: bool = False):
+        if refresh or "" not in self.dircache:
+            # replace root list on refresh, or build if missing
+            self.dircache[""] = []
+            projects = await self.gitlab_client.retrieve_root_level()
+            for entry in projects:
+                flat = self._register_repo(
+                    project_id=entry["id"],
+                    original_path=entry["original_path"],
+                    readable_path=entry["readable_path"],
+                )
+                self.dircache[""].append({
+                    "name": flat,
+                    "type": "dir",
+                    "size": None,
+                    "is_project": True,
+                })
+
+
+    async def _update_project_dir(self, flat_key: str, repo_id: int, subdir: str):
+        """
+        Populate dircache entries for a repository subdirectory.
+
+        Notes
+        -----
+        - `subdir` is an inside-repo path; "" means repo root.
+        - GitLab `repository/tree` returns entries with `path` **repo-root-relative**.
+          Therefore we must not re-prefix `subdir` when composing cache keys, or
+          we will duplicate it (e.g. `<repo>/dir/dir/file`).
+        - Parent cache keys are built from the **repo-root-relative** parent path
+          and normalized so that `"."` → "".
+        """
+        subdir = self._norm_inside(subdir)
+        files = await self.gitlab_client.retrieve_project_level(repo_id, self.per_page, subdir)
+
+        # Ensure the directory listings exists in cache
+        listing_key = flat_key if not subdir else f"{flat_key}/{subdir}"
+        self.dircache.setdefault(listing_key, [])
+
+        for entry in files:
+            # GitLab returns repo-root-relative paths
+            rel = entry["path"]
+            ## (Safety) if API ever returns subdir-relative, re-root it
+            #if subdir and not rel.startswith(subdir + "/") and rel != subdir:
+            #    rel = f"{subdir}/{rel}"
+
+            # Parent inside the repo; normalize so '.' → ''
+            parent_rel = self._norm_inside(str(PurePosixPath(rel).parent))
+            parent_cache = flat_key if not parent_rel else f"{flat_key}/{parent_rel}"
+            self.dircache.setdefault(parent_cache, [])
+
+            # If this is a directory, ensure its own cache key exists
+            if entry["type"] == "tree":
+                self.dircache.setdefault(f"{flat_key}/{rel}", [])
+
+            # Append child entry to its parent listing
+            val = {
+                "name": entry["name"],
+                "type": "dir" if entry["type"] == "tree" else "file",
+                "size": None,
+            }
+            # Check for duplicates
+            if not any(e.get("name") == val["name"] and e.get("type") == val["type"] for e in self.dircache[parent_cache]):
+                self.dircache[parent_cache].append(val)
+
+    async def _resolve_path(self, path: str) -> tuple[dict, str]:
+        """
+        Resolve any input path into (repo_record, inside_path).
+
+        - Flat addressing: first component contains `self.sep` or id suffix `__<digits>`.
+        - Canonical addressing: otherwise, try decreasing prefixes against GET /projects/:path.
+        """
+        clean = (path or "").lstrip("/")
+        if not clean:
+            return ({}, "")
+
+        first = clean.split("/", 1)[0]
+        is_flat = (self.sep in first)
+
+        if is_flat:
+            head, tail = map(str, split_first(clean))
+            repo = await self._ensure_repo_registered_flat(head)
+            return repo, self._norm_inside(tail)
+
+        # canonical paths: try decreasing prefixes 
+        # (FIRST: check local maps to avoid HTTP)
+        parts = clean.split("/")
+        for i in range(len(parts), 0, -1):
+            candidate = "/".join(parts[:i])
+            flat = self._flat_by_original.get(candidate)
+            if flat:
+                repo = {**self._repo_by_flat[flat], "flat": flat}
+                remainder = "/".join(parts[i:])
+                return repo, self._norm_inside(remainder)
+
+        # fallback: do the HTTP lookups only if not known locally
+        for i in range(len(parts), 0, -1):
+            candidate = "/".join(parts[:i])
+            proj = await self.gitlab_client.get_project_by_path(candidate)
+            if proj is not None:
+                flat = self._register_repo(
+                    project_id=proj["id"],
+                    original_path=proj["original_path"],
+                    readable_path=proj["readable_path"],
+                )
+                repo = {**self._repo_by_flat[flat], "flat": flat}
+                remainder = "/".join(parts[i:])
+                return repo, self._norm_inside(remainder)
+
+        raise FileNotFoundError(f"No matching project found in path '{path}'")
+    
+    ##### Async replacement if fallbnack takes to much time. But should be rarely needed ####
+    """
+    candidates: list[tuple[int, str]] = [(i, "/".join(parts[:i])) for i in range(len(parts), 0, -1)]
+
+    async def fetch(i: int, cand: str):
+        async with self.semaphore:
+            try:
+                proj = await self.gitlab_client.get_project_by_path(cand)
+            except Exception:
+                proj = None
+            return i, cand, proj
+
+    results = await asyncio.gather(*(fetch(i, cand) for i, cand in candidates))
+
+    # `gather` preserves input order (longest→shortest), so the first non-None is the longest match
+    for i, cand, proj in results:
+        if proj is not None:
+            flat = self._register_repo(
+                project_id=proj["id"],
+                original_path=proj["original_path"],
+                readable_path=proj["readable_path"],
+            )
+            repo = {**self._repo_by_flat[flat], "flat": flat}
+            remainder = "/".join(parts[i:])
+            return repo, self._norm_inside(remainder)
+    """
+
+
+    # ───────────────────────────── fsspec methods ────────────────────────────
     async def close(self):
         await self.gitlab_client.close()
     
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.close()
-
-    def __del__(self):
-        if self._session and not self._session.closed:
-            import warnings
-            warnings.warn(
-                "GitLabClient session was not properly closed. "
-                "Call `await client.close()` or use `async with`.",
-                ResourceWarning,
-            )
-
-    async def _set_session(self):
-        if self._session is None:
-            headers = {}
-            if self.token is not None:
-                headers["PRIVATE-TOKEN"] = self.token
-            self._session = aiohttp.ClientSession(headers=headers)
-        return self._session
-
     async def _ls(self, path, detail=True, **kwargs):
-        """
-        List the contents of a path in the GitLab repository.
-        Uses caching unless refresh=True or caching is disabled.
-        """
         refresh = kwargs.get("refresh", False)
-
-        # Normalize path to string
         path = (path or "").strip("/")
 
-        # Fetch root-level or project-level if not cached
-        if not refresh or path not in self.dircache:
-            if path == "":
+        if not path:
+            if refresh or "" not in self.dircache:
                 await self._update_root_dir()
-            else:
-                await self._update_project_dir(path)
+            listing = self.dircache.get("", [])
+            return listing if detail else [d["name"] for d in listing]
 
-        listing = self.dircache.get(path, [])
+        repo, inside = await self._resolve_path(path)      # inside already normalized
+        key = repo["flat"]
+        cache_key = f"{key}/{inside}" if inside else key
+
+        if refresh or cache_key not in self.dircache:
+            await self._update_project_dir(key, repo["id"], inside)  # pass normalized subdir
+
+        listing = self.dircache.get(cache_key, [])
         return listing if detail else [d["name"] for d in listing]
 
     async def _info(self, path, **kwargs):
-        """
-        Get information about a file or directory in the GitLab repository.
-        """
-        if path == "" and path not in self.dircache:
-            await self._update_root_dir()
-            return self.dircache[""]
-        elif path == "":
+        path = (path or "").strip("/")
+        # If path is the empty string, return root info.
+        if not path:
+            if "" not in self.dircache:
+                await self._update_root_dir()
             return self.dircache[""]
 
-        repo_path, inside_path = map(str, split_first(path))
+        repo, inside = await self._resolve_path(path)   # normalized
+        key = repo["flat"]
 
-        # NOTE: Instead of retieving the project level directly, we could also
-        # check first if the path is a repository toplevel. Thic could be done
-        # by iterating trhough self.dircache[""] and checking if the path is in
-        # there. Could potentially save some requests.
-        if repo_path not in self.dircache:
-            # If the path is not in the cache, retrieve it.
-            await self._update_project_dir(repo_path)
-        info = self.dircache.get(repo_path, None)
-        if info is None:
-            # If the path is still not found, raise an error.
-            raise FileNotFoundError(f"Path '{path}' not found in repository.")
-        if path == repo_path:
-            # If the path is the repository root, return its info.
+        if not inside:
             return {
-                "name": Path(repo_path).name,
+                "name": Path(key).name,
                 "type": "directory",
                 "size": None,
-                "path": str(Path(repo_path)),
+                "path": key,
                 "is_project": True,
             }
-        for item in info:
-            if item["name"] == Path(inside_path).name:
-                # Return the item if it matches the inside path.
+
+        parent_rel = self._norm_inside(str(PurePosixPath(inside).parent))
+        parent_cache = f"{key}/{parent_rel}" if parent_rel else key
+        if parent_cache not in self.dircache:
+            await self._update_project_dir(key, repo["id"], parent_rel)
+
+        name = Path(inside).name
+        for item in self.dircache.get(parent_cache, []):
+            if item["name"] == name:
                 return {
                     "name": item["name"],
                     "type": item["type"],
-                    "size": item.get("size", None),
-                    "path": str(Path(repo_path, inside_path)),
-                    "is_project": item.get("is_project", False),
+                    "size": item.get("size"),
+                    "path": f"{key}/{inside}",
+                    "is_project": False,
                 }
-        # If no item matches, raise an error.
         raise FileNotFoundError(f"Path '{path}' not found in repository.")
-    
-    async def _put_file(self, lpath, rpath, mode="overwrite", **kwargs):
-        return await super()._put_file(lpath, rpath, mode, **kwargs)
 
-    async def _get_file(self, rpath, lpath, **kwargs):
-        """ "
-        Get the content of a file in a GitLab repository and save it locally.
-        """
-        # Get the repository name from the path, the id and the path of the file inside the repository.
-        repo_name = get_repo_name_from_path(rpath)
-        id = self._repo_lookup.get(repo_name, {}).get("id", None)
-        _, inside_path = split_first(rpath)
 
-        if id is None:
-            await self._update_root_dir()
-            id = self._repo_lookup.get(repo_name, {}).get("id", None)
-        if id is None:
-            # If the ID is still not found, raise an error.
-            raise ValueError(
-                f"Project ID for path '{rpath}' not found in repository lookup."
+    async def _open(self, path, mode='rb', block_size=None, autocommit=True,
+                    cache_options=None, compression=None, **kwargs) -> AbstractAsyncStreamedFile:
+        is_write = 'w' in mode or 'a' in mode
+        is_read = 'r' in mode
+
+        repo, inside = await self._resolve_path(path)   # normalized
+        if not inside:
+            raise IsADirectoryError(f"'{path}' points to a repository, not a file")
+
+        key = repo["flat"]
+        parent_rel = self._norm_inside(str(PurePosixPath(inside).parent))
+        parent_cache = f"{key}/{parent_rel}" if parent_rel else key
+        if parent_cache not in self.dircache:
+            await self._update_project_dir(key, repo["id"], parent_rel)
+
+        name = Path(inside).name
+        exists = any(e["name"] == name for e in self.dircache.get(parent_cache, []))
+
+        if is_write:
+            if exists:
+                raise FileExistsError(f"{path} already exists — refusing to overwrite with LFS.")
+            return AsyncLFSFile(
+                fs=self,
+                path=inside,                 # normalized
+                token=self.token,
+                host=self._base_url,
+                namespace=repo["original_path"],
+                repo_id=repo["id"],
+                ref="main",
+                mode=mode,
             )
-        api_url = f"{self._base_url}/api/v4/projects/{id}/repository/files/{quote(str(inside_path))}/raw"
-        await self._set_session()
-        if self._session is None:
-            raise RuntimeError("aiohttp session was not initialized")
-        async with self._session.get(
-            api_url, params={"lfs": "True", "ref": "main"}
-        ) as r:
-            if r.status != 200:
-                raise Exception(f"Failed to download {rpath}: {r.status}")
-            async with aio_open(lpath, "wb") as f:
-                async for chunk in r.content.iter_chunked(2**20):  # 1 MB
-                    await f.write(chunk)
-        return
-
-    async def _exists(self, path, **kwargs):
-        """
-        Check if a path exists in the GitLab repository.
-        """
-        try:
-            info = await self._info(path, **kwargs)
-            return info is not None
-        except FileNotFoundError:
-            return False
-
-    async def _isdir(self, path):
-        try:
-            info = await self._info(path)
-            if info is None:
-                return False
-            return info["type"] == "directory"
-        except FileNotFoundError:
-            return False
-
-    async def _isfile(self, path):
-        try:
-            info = await self._info(path)
-            if info is None:
-                return False
-            return info["type"] == "file"
-        except FileNotFoundError:
-            return False
-
-    async def _update_root_dir(self):
-        """
-        Update the root directory cache by retrieving the root level projects.
-        Also updates the _repo_lookup dictionary with project metadata.
-        This is called when the root directory is accessed and not cached.
-        """
-        projects = await self.gitlab_client.retrieve_root_level()
-
-        if not self.dircache.get("", None):
-            self.dircache[""] = []
-        for entry in projects:
-            # entry = {"name", "id", "original_path", ...}
-            self.dircache[""].append({
-                "name": entry["name"],
-                "type": "dir",
-                "size": None,
-                "is_project": True,
-            })
-            self._repo_lookup[entry["name"]] = {
-                "id": entry["id"],
-                "original_path": entry["original_path"],
-                "readable_path": entry["readable_path"]
-            } 
-
-    async def _update_project_dir(self, path):
-        id = self._repo_lookup.get(path, {}).get("id", None)
-        if id is None:
-            await self._update_root_dir()
-            id = self._repo_lookup.get(path, {}).get("id", None)
-        if id is None:
-            # If the ID is still not found, raise an error.
-            raise ValueError(
-                f"Project ID for path '{path}' not found in repository lookup."
+        elif is_read:
+            if not exists:
+                await self._update_project_dir(key, repo["id"], parent_rel)
+                parent_listing = self.dircache.get(parent_cache, [])
+                if not any(e["name"] == name for e in parent_listing):
+                    raise FileNotFoundError(path)
+            return AsyncLFSFile(
+                fs=self,
+                path=inside,                 # normalized
+                token=self.token,
+                host=self._base_url,
+                namespace=repo["original_path"],
+                repo_id=repo["id"],
+                ref="main",
+                mode=mode,
             )
-        files = await self.gitlab_client.retrieve_project_level(path, id, self.per_page)
-
-        for file in files:
-            file_path = str(Path(path, file["path"]))
-            # Add each directory in dircache
-            if file["type"] == "tree":
-                self.dircache[file_path] = []
-            parent_path = str(Path(file_path).parent)
-            # if parent_path == ".":
-            #    parent_path = file_path
-            if parent_path not in self.dircache:
-                # Initialize the parent directory in dircache if not already present
-                self.dircache[parent_path] = []
-            val = {
-                "name": file["name"],
-                "type": "dir" if file["type"] == "tree" else "file",
-                "size": None,
-            }
-            # Add the file to the parent directory's cache
-            self.dircache[parent_path].append(val)
-
-    async def _upload_lfs_file_async(self, local_path: str, file_size: int, ref: str, url: str) -> str:
-        """
-        Upload a file to GitLab via the LFS Batch API (async version).
-
-        Args:
-            local_path (str): Local file path to upload
-            file_size (int): Size of the file in bytes
-            ref (str): Target branch (e.g., "upload/2025-06-04T15-20-11")
-
-        Returns:
-            str: SHA256 object ID of the uploaded LFS file
-        """
-        await self._set_session()
-        if self._session is None:
-            raise RuntimeError("aiohttp session was not initialized")
-        
-        # Step 1: Compute SHA-256 OID
-        oid = await calculate_sha256(local_path)
-    
-        # Step 2: Prepare LFS batch request
-        lfs_payload = {
-            "operation": "upload",
-            "transfers": ["basic"],
-            "ref": {"name": f"refs/heads/{ref}"},
-            "hash_algo": "sha256",
-            "objects": [
-                {
-                    "oid": oid,
-                    "size": file_size
-                }
-            ]
-        }
-
-        headers = {
-            "Accept": "application/vnd.git-lfs+json",
-            "Content-Type": "application/vnd.git-lfs+json"
-        }
-
-        host, namespace = split_base_url(url)
-        batch_url = (
-            f"https://oauth2:{self.token}@{host}/"
-            f"{namespace}.git/info/lfs/objects/batch"
-        )
-
-        # Step 3: Call LFS batch API
-        async with self._session.post(batch_url, json=lfs_payload, headers=headers) as resp:
-            if resp.status != 200:
-                raise Exception(f"LFS batch API failed: {resp.status}")
-            result = await resp.json()
-
-        # Step 4: Extract upload instructions
-        try:
-            upload_info = result["objects"][0]["actions"]["upload"]
-            upload_url = upload_info["href"]
-            upload_headers = upload_info.get("header", {})
-            upload_headers.pop("Transfer-Encoding", None)
-        except KeyError:
-            print("LFS object already exists or upload skipped.")
-            return oid
-
-        # Step 5: Upload binary data to pre-signed S3 URL
-        async with aio_open(local_path, "rb") as f:
-            async with self._session.put(
-                upload_url, headers=upload_headers, data=f
-            ) as upload_resp:
-                if upload_resp.status >= 300:
-                    raise Exception(f"LFS object upload failed: {upload_resp.status}")
-
-        print(f"LFS upload successful: oid={oid}")
-        return oid
+        else:
+            raise NotImplementedError(f"Unsupported file mode: {mode}")
 
 
 if __name__ == "__main__":
@@ -317,20 +386,48 @@ if __name__ == "__main__":
         token = os.getenv("GITLAB_TOKEN")
         base_url = "https://git.nfdi4plants.org"
         teschd = GitLab_ARC_FileSystem(base_url=base_url, token=token)
+
+
+        # Examples of the new capabilities:
+        # 1) Canonical path listing without listing root first
+        # await fs._ls("group/sub/repo", detail=True)
+
+        # 2) Mixed addressing: canonical to open, flattened to continue
+        # f = await fs._open("group/sub/repo/path/to/file.txt", mode="rb")
+        # async with f as fh:
+        #     data = await fh.read()
+
+        
+
         # result = await teschd._retrieve_root_level(per_page=100)
         # res = await teschd._retrieve_project_level("usadellab-Barvista_ARC")
-        res = await teschd._ls("", detail=False)
-        res = await teschd._ls("usadellab-Barvista_ARC", detail=False)
-        print(res)
+        #res = await teschd._ls("", detail=False)
+        #res = await teschd._ls("usadellab-Barvista_ARC", detail=False)
+        #print(res)
         # print(res)
         #await teschd._get_file("usadellab-Barvista_ARC/README.md", "README.md")
-        #print(await teschd._exists("usadellab-Barvista_ARC/README.md"))
-        #print(await teschd._exists("usadellab-Barvista_ARC/README."))
-        #print(await teschd._isdir("usadellab-Barvista_ARC"))
-        #print(await teschd._isfile("usadellab-Barvista_ARC/README.md"))
-        #print(await teschd._info("usadellab-Barvista_ARC/README.md"))
+        print(await teschd._exists("usadellab::Barvista_ARC/README.md"))
+        print(await teschd._exists("usadellab Barvista_ARC/README."))
+        print(await teschd._isdir("usadellab-Barvista_ARC"))
+        print(await teschd._isfile("usadellab-Barvista_ARC/README.md"))
+        print(await teschd._info("usadellab-Barvista_ARC/README.md"))
 
-        #bala = teschd.ls("usadellab-Barvista_ARC", detail=True)
+        bala = await teschd._ls("julian.weidhase::test12345", detail=True)
+        print(bala)
+
+        local_path = "Unbenannt.jpeg"
+        remote_path = "julian.weidhase::test12345/Unbenannt.jpeg"
+
+        # Read local file data
+        with open(local_path, "rb") as f_local:
+            data = f_local.read()
+
+        # Async open and write
+        f_remote = await teschd._open(remote_path, mode="wb")
+        async with f_remote:  # This works because AsyncLFSFile implements __aenter__ and __aexit__
+            await f_remote.write(data)
+
         await teschd.close()
+
 
     asyncio.run(main())
