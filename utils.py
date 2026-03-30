@@ -1,70 +1,79 @@
-from pathlib import Path
-from urllib.parse import urlparse
+from __future__ import annotations
+
+from pathlib import Path, PurePosixPath
 import hashlib
 import aiofiles
 
 
 def split_first(path: Path | str):
     """
-    Return a (head, tail) tuple where
-    • head  – the first component of *path*
-    • tail  – everything that remains after the head
-    Both elements are `Path` objects.
+    Split a path into (head, tail).
+
+    Example:
+        split_first("a/b/c") -> ("a", "b/c")
     """
     p = Path(path)
-    drive = p.drive
-    parts = p.parts[1:] if drive else p.parts
-
+    parts = p.parts
     if not parts:
-        return Path(p), Path()
-
-    if p.is_absolute() and not drive:
-        head = Path("/", parts[0])
-        tail = Path(*parts[1:])
-    else:
-        head = Path(drive, parts[0]) if drive else Path(parts[0])
-        tail = Path(*parts[1:])
-
-    return head, tail
+        return Path(""), Path("")
+    return Path(parts[0]), Path(*parts[1:])
 
 
-def get_repo_name_from_path(path: str) -> str:
-    path = Path(path).as_posix().lstrip("/")
-    return path.split("/", 1)[0]
+def norm_inside(inside: str | None) -> str:
+    """
+    Normalize a repository-internal path.
 
+    - POSIX-style
+    - no leading slash
+    - no trailing slash
+    - empty or "." becomes ""
 
-def is_direct_subdir(parent: str, child: str, resolve_symlinks: bool = False) -> bool:
-    if resolve_symlinks:
-        parent_path = Path(parent).resolve(strict=False)
-        child_path = Path(child).resolve(strict=False)
-    else:
-        parent_path = Path(parent).absolute()
-        child_path = Path(child).absolute()
-    try:
-        child_path.relative_to(parent_path)
-    except ValueError:
-        return False
-    return parent_path != child_path and child_path.parent == parent_path
-
-
-def prefix_path(path_prefix, path):
-    return "/" + path_prefix + "/" + path
-
-
-def split_base_url(base_url: str):
-    parsed = urlparse(base_url)
-    host = parsed.netloc
-    path = parsed.path.strip("/")
-    return host, path
+    Examples:
+        norm_inside("/a/b/") -> "a/b"
+        norm_inside("")      -> ""
+        norm_inside(None)    -> ""
+    """
+    if not inside:
+        return ""
+    norm = str(PurePosixPath(str(inside))).strip("/")
+    return "" if norm in ("", ".") else norm
 
 
 async def calculate_sha256(file_path: str) -> str:
-    sha256 = hashlib.sha256()
+    """
+    Asynchronously calculate the SHA256 checksum of a local file.
+
+    Used for LFS pointer creation.
+    """
+    sha = hashlib.sha256()
     async with aiofiles.open(file_path, "rb") as f:
         while True:
             chunk = await f.read(8192)
             if not chunk:
                 break
-            sha256.update(chunk)
-    oid = sha256.hexdigest()
-    return oid
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def lfs_pointer_text(sha: str, size: int) -> str:
+    """
+    Generate the exact Git LFS pointer file content.
+    """
+    return (
+        "version https://git-lfs.github.com/spec/v1\n"
+        f"oid sha256:{sha}\n"
+        f"size {size}\n"
+    )
+
+
+def legacy_gitattributes_block(path_str: str) -> str:
+    """
+    Generate a .gitattributes block compatible with the legacy ARC/LFS layout.
+
+    IMPORTANT:
+    This mirrors your old pyfilesystem-based implementation byte-for-byte.
+    """
+    return (
+        "# Leave following line: auto generated\n"
+        f"{path_str} filter=lfs diff=lfs merge=lfs -text \n"
+    )

@@ -1,172 +1,291 @@
-import aiohttp
+from __future__ import annotations
+
 import asyncio
-from itertools import chain
+from typing import Any, Optional
 from urllib.parse import quote
+import warnings
+import aiohttp
 
 
 class GitLabClient:
-    """Thin async GitLab API wrapper used by the filesystem."""
-
-    def __init__(self, base_url, token):
-        self._base_url = base_url.rstrip("/")
-        self._session = None
+    def __init__(self, base_url: str, token: Optional[str]):
+        self.base_url = base_url.rstrip("/")
         self.token = token
 
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+        self._session: aiohttp.ClientSession | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    async def _set_session(self):
-        if self._session is None:
-            headers = {}
-            if self.token is not None:
+    async def _ensure(self) -> aiohttp.ClientSession:
+        """
+        Ensure we have a ClientSession bound to the current running event loop.
+
+        If the loop changes (common when mixing sync wrappers + asyncio.run),
+        the old session must be closed and recreated, otherwise aiohttp will throw.
+        """
+        loop = asyncio.get_running_loop()
+
+        if self._loop is not None and self._loop is not loop:
+            await self.close()
+
+        if self._session is None or self._session.closed:
+            headers: dict[str, str] = {}
+            if self.token:
                 headers["PRIVATE-TOKEN"] = self.token
             self._session = aiohttp.ClientSession(headers=headers)
+            self._loop = loop
+
         return self._session
 
-    async def get_project_by_path(self, original_path: str) -> dict | None:
-        session = await self._set_session()
-        api_url = f"{self._base_url}/api/v4/projects/{quote(original_path, safe='')}"
-        async with session.get(api_url) as resp:
-            if resp.status == 404:
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        self._loop = None
+
+    async def get_project_by_path(self, path_with_namespace: str) -> dict[str, Any] | None:
+        """
+        Lookup a project by its full `path_with_namespace` (e.g. "group/sub/repo").
+
+        Returns a minimal dict:
+            {"id": <int>, "original_path": <path_with_namespace>}
+        """
+        s = await self._ensure()
+        url = f"{self.base_url}/api/v4/projects/{quote(path_with_namespace, safe='')}"
+        async with s.get(url) as r:
+            if r.status == 404:
                 return None
-            if resp.status != 200:
-                raise Exception(f"GitLab API error: {resp.status}")
-            project = await resp.json()
-            return {
-                "id": project["id"],
-                "original_path": project["path_with_namespace"],
-                "readable_path": project["name_with_namespace"],
-            }
+            r.raise_for_status()
+            j = await r.json()
+            return {"id": j["id"], "original_path": j["path_with_namespace"]}
 
-    async def get_project_by_id(self, project_id: int) -> dict | None:
-        session = await self._set_session()
-        api_url = f"{self._base_url}/api/v4/projects/{project_id}"
-        async with session.get(api_url) as resp:
-            if resp.status == 404:
-                return None
-            if resp.status != 200:
-                raise Exception(f"GitLab API error: {resp.status}")
-            project = await resp.json()
-            return {
-                "id": project["id"],
-                "original_path": project["path_with_namespace"],
-                "readable_path": project["name_with_namespace"],
-            }
+    async def _retrieve_root_level_sequential(
+            self,
+            *,
+            per_page: int = 100,
+            membership: bool = False,
+            archived: bool = False,
+            simple: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Old behavior: sequential offset pagination via X-Next-Page.
+        """
+        s = await self._ensure()
+        url = f"{self.base_url}/api/v4/projects"
 
-    async def retrieve_root_level(self, per_page=100) -> list[dict]:
-        session = await self._set_session()
-        if session is None:
-            raise RuntimeError("aiohttp session was not initialized")
-
-        api_url = f"{self._base_url}/api/v4/projects"
-        base_params = {
-            "per_page": per_page,
-            "simple": "True",
+        params: dict[str, Any] = {
+            "per_page": int(per_page),
+            "page": 1,
             "order_by": "last_activity_at",
             "sort": "desc",
+            "membership": str(bool(membership)).lower(),
+            "archived": str(bool(archived)).lower(),
         }
+        if simple:
+            params["simple"] = "true"
 
-        async with session.get(api_url, params={**base_params, "page": 1}) as resp:
-            if resp.status != 200:
-                raise Exception(f"GitLab API error: {resp.status}")
-            first_page = await resp.json()
-            total_pages = int(resp.headers.get("X-Total-Pages", 1))
+        out: list[dict[str, Any]] = []
 
-        async def fetch_page(page: int):
-            params = {**base_params, "page": page}
-            async with session.get(api_url, params=params) as r:
-                if r.status != 200:
-                    raise Exception(f"GitLab API error on page {page}: {r.status}")
-                return await r.json()
+        while True:
+            async with s.get(url, params=params) as r:
+                r.raise_for_status()
+                data = await r.json()
+                out.extend(
+                    {
+                        "id": p["id"],
+                        "original_path": p["path_with_namespace"],
+                    }
+                    for p in data
+                )
 
-        tasks = [fetch_page(page) for page in range(2, total_pages + 1)]
-        remaining_pages = await asyncio.gather(*tasks) if total_pages > 1 else []
+                next_page = r.headers.get("X-Next-Page") or ""
+                if not next_page:
+                    break
+                params["page"] = int(next_page)
 
-        projects = [
-            {
-                "name": project["path_with_namespace"],
-                "id": project["id"],
-                "original_path": project["path_with_namespace"],
-                "readable_path": project["name_with_namespace"],
-            }
-            for project in chain(first_page, *remaining_pages)
-        ]
-        return projects
+        return out
 
-    async def retrieve_project_level(self, repo_id: int, per_page=100, subdir="") -> list[dict]:
-        await self._set_session()
-        if self._session is None:
-            raise RuntimeError("aiohttp session was not initialized")
+    async def retrieve_root_level(
+            self,
+            *,
+            per_page: int = 100,
+            page: int | None = None,
+            paginate: bool = False,
+            membership: bool = False,
+            archived: bool = False,
+            simple: bool = True,
+            concurrent_offset: bool = False,
+            max_concurrency: int = 8,
+    ) -> list[dict[str, Any]]:
+        """
+        Public root listing via GET /projects.
 
-        base_url = f"{self._base_url}/api/v4/projects/{repo_id}/repository/tree"
-        params = {
-            "per_page": per_page,
-            "pagination": "keyset",
-            "path": subdir,
+        Notes:
+          - This currently supports offset-based pagination only.
+          - Keyset pagination is not implemented here.
+
+        Modes:
+          - paginate=False, concurrent_offset=False:
+              use sequential offset pagination and return the full listing.
+          - paginate=False, concurrent_offset=True:
+              fetch page 1 first, then remaining offset pages concurrently
+              when X-Total-Pages is available; otherwise fall back to sequential.
+          - paginate=True:
+              fetch exactly one offset page and return only that page.
+              This mode is incompatible with concurrent_offset=True.
+        """
+        if per_page < 1:
+            raise ValueError("per_page must be >= 1")
+
+        if paginate:
+            if page is None:
+                raise ValueError("paginate=True requires page to be set")
+            if page < 1:
+                raise ValueError("page must be >= 1")
+
+        if paginate and concurrent_offset:
+            raise ValueError("paginate=True cannot be used together with concurrent_offset=True")
+
+        s = await self._ensure()
+        url = f"{self.base_url}/api/v4/projects"
+
+        base_params: dict[str, Any] = {
+            "per_page": int(per_page),
+            "order_by": "last_activity_at",
+            "sort": "desc",
+            "membership": str(bool(membership)).lower(),
+            "archived": str(bool(archived)).lower(),
         }
+        if simple:
+            base_params["simple"] = "true"
 
-        async with self._session.get(base_url, params={**params, "page": 1}) as resp:
-            if resp.status != 200:
-                raise Exception(f"GitLab API error: {resp.status}")
-            first_page = await resp.json()
-            total_pages = int(resp.headers.get("X-Total-Pages", 1))
-
-        async def fetch_page(page):
-            async with self._session.get(base_url, params={**params, "page": page}) as r:
-                if r.status != 200:
-                    raise Exception(f"GitLab API error on page {page}: {r.status}")
-                return await r.json()
-
-        more_pages = (
-            await asyncio.gather(*[fetch_page(p) for p in range(2, total_pages + 1)])
-            if total_pages > 1
-            else []
-        )
-        return list(chain(first_page, *more_pages))
-
-    async def commit_and_push_lfs(self, repo_id, branch, filepath, sha, size):
-        pointer_content = (
-            "version https://git-lfs.github.com/spec/v1\n"
-            f"oid sha256:{sha}\n"
-            f"size {size}\n"
-        )
-
-        commit_url = f"{self._base_url}/api/v4/projects/{repo_id}/repository/commits"
-        headers = {"PRIVATE-TOKEN": self.token}
-        payload = {
-            "branch": branch,
-            "commit_message": f"Add LFS file {filepath}",
-            "actions": [
+        def normalize(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
                 {
-                    "action": "create",
-                    "file_path": filepath,
-                    "content": pointer_content,
-                    "encoding": "text",
+                    "id": p["id"],
+                    "original_path": p["path_with_namespace"],
                 }
-            ],
-        }
+                for p in data
+            ]
 
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.post(commit_url, json=payload) as resp:
-                if resp.status >= 300:
-                    raise RuntimeError(f"Failed to commit LFS pointer file: {resp.status}")
-                return await resp.json()
+        def warn_fallback(reason: str) -> None:
+            warnings.warn(
+                f"retrieve_root_level: falling back to sequential pagination ({reason})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
-    async def create_merge_request(self, repo_id, source_branch, target_branch, title):
-        mr_url = f"{self._base_url}/api/v4/projects/{repo_id}/merge_requests"
-        headers = {"PRIVATE-TOKEN": self.token}
-        payload = {
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "title": title,
-            "remove_source_branch": True,
-        }
+        async def fetch_page(page_num: int) -> tuple[int, list[dict[str, Any]], dict[str, str]]:
+            params = dict(base_params)
+            params["page"] = page_num
+            async with s.get(url, params=params) as r:
+                r.raise_for_status()
+                data = await r.json()
+                headers = {k.lower(): v for k, v in r.headers.items()}
+                return page_num, normalize(data), headers
 
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.post(mr_url, json=payload) as resp:
-                if resp.status == 409:
-                    return
-                if resp.status >= 300:
-                    raise RuntimeError(f"Failed to create merge request: {resp.status}")
-                return await resp.json()
+        # Paged mode: fetch exactly one page
+        if paginate:
+            _, items, _ = await fetch_page(page)
+            return items
+
+        # Full-list mode: existing sequential behavior
+        if not concurrent_offset:
+            return await self._retrieve_root_level_sequential(
+                per_page=per_page,
+                membership=membership,
+                archived=archived,
+                simple=simple,
+            )
+
+        # Full-list mode with concurrent offset fetching
+        try:
+            _, first_items, first_headers = await fetch_page(1)
+
+            total_pages_raw = first_headers.get("x-total-pages") or ""
+            if not total_pages_raw:
+                warn_fallback("X-Total-Pages header unavailable")
+                return await self._retrieve_root_level_sequential(
+                    per_page=per_page,
+                    membership=membership,
+                    archived=archived,
+                    simple=simple,
+                )
+
+            total_pages = int(total_pages_raw)
+            if total_pages <= 1:
+                return first_items
+
+            semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+
+            async def bounded_fetch(page_num: int) -> tuple[int, list[dict[str, Any]]]:
+                async with semaphore:
+                    fetched_page, items_b, _ = await fetch_page(page_num)
+                    return fetched_page, items_b
+
+            results = await asyncio.gather(
+                *(bounded_fetch(page_num) for page_num in range(2, total_pages + 1))
+            )
+
+            results.sort(key=lambda x: x[0])
+
+            out = list(first_items)
+            for _, items in results:
+                out.extend(items)
+
+            return out
+
+        except Exception as exc:
+            warn_fallback(f"concurrent fetch failed: {exc!r}")
+            return await self._retrieve_root_level_sequential(
+                per_page=per_page,
+                membership=membership,
+                archived=archived,
+                simple=simple,
+            )
+
+    async def retrieve_project_level(
+        self,
+        repo_id: int,
+        subdir: str,
+        *,
+        ref: str = "main",
+        per_page: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        List a directory in a repository: GET /projects/:id/repository/tree (paged).
+
+        Returns the raw JSON items (each has "type" in {"blob","tree"} and "path"/"name").
+        """
+        s = await self._ensure()
+        url = f"{self.base_url}/api/v4/projects/{repo_id}/repository/tree"
+
+        params: dict[str, Any] = {"ref": ref, "per_page": int(per_page), "page": 1}
+        if subdir:
+            params["path"] = subdir
+
+        out: list[dict[str, Any]] = []
+
+        while True:
+            async with s.get(url, params=params) as r:
+                r.raise_for_status()
+                out.extend(await r.json())
+
+                next_page = r.headers.get("X-Next-Page") or ""
+                if not next_page:
+                    break
+                params["page"] = int(next_page)
+
+        return out
+
+    async def get_raw_file(self, repo_id: int, path: str, ref: str) -> bytes:
+        """
+        Fetch raw file content. We pass lfs=true so GitLab resolves LFS objects.
+        """
+        s = await self._ensure()
+        url = f"{self.base_url}/api/v4/projects/{repo_id}/repository/files/{quote(path, safe='')}/raw"
+
+        async with s.get(url, params={"ref": ref, "lfs": "true"}) as r:
+            if r.status == 404:
+                raise FileNotFoundError(path)
+            r.raise_for_status()
+            return await r.read()
