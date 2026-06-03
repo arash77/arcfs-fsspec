@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcfs-fsspec"
+version = "0.1.7"
+description = "GitLab ARC filesystem backend for fsspec"
+requires-python = ">=3.11"
+dependencies = [
+  "aiofiles",
+  "aiohttp",
+  "fsspec",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "pytest-asyncio",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
