@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import pytest
 
 import arcfs.async_lfs_file as async_lfs_file_module
+import arcfs.fs as fs_module
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
 
@@ -17,6 +18,7 @@ class FakeGitLabClient:
         self.project_calls: list[tuple[int, str, str]] = []
         self.project_by_path_calls: list[str] = []
         self.project_by_id_calls: list[int] = []
+        self.project_page_calls: list[dict] = []
         self.stream_calls: list[dict] = []
 
         self.projects = {
@@ -64,6 +66,28 @@ class FakeGitLabClient:
         if key not in self.tree:
             raise FileNotFoundError(f"No such directory in fake tree: {key}")
         return list(self.tree[key])
+
+    async def retrieve_project_level_page(
+        self,
+        *,
+        repo_id,
+        subdir,
+        ref,
+        page,
+        per_page,
+    ):
+        self.project_page_calls.append(
+            {
+                "repo_id": repo_id,
+                "subdir": subdir,
+                "ref": ref,
+                "page": page,
+                "per_page": per_page,
+            }
+        )
+        items = self.tree[(repo_id, subdir)]
+        start = (page - 1) * per_page
+        return items[start:start + per_page], len(items)
 
     async def get_project_by_path(self, path_with_namespace):
         self.project_by_path_calls.append(path_with_namespace)
@@ -264,7 +288,7 @@ def test_open_sync_hook_returns_async_lfs_file():
         assert opened.path == "README.md"
         asyncio.run(opened.close())
     finally:
-        asyncio.run(fs._close())
+        fs.close()
 
 
 @pytest.mark.asyncio
@@ -462,6 +486,115 @@ async def test_rm_disabled(fs: GitLabARCFileSystem):
 async def test_close_closes_client(fs: GitLabARCFileSystem):
     await fs._close()
     assert fs.client.closed is True
+
+
+def test_close_sync_wrapper_closes_client(monkeypatch):
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+    sync_calls = []
+
+    def run_sync(loop, func, *args, **kwargs):
+        sync_calls.append({"loop": loop, "func": func.__name__})
+        return asyncio.run(func(*args, **kwargs))
+
+    monkeypatch.setattr(fs_module, "sync", run_sync)
+
+    fs.close()
+
+    assert fs.client.closed is True
+    assert sync_calls == [{"loop": fs.loop, "func": "_close"}]
+
+
+def test_list_page_sync_wrapper_calls_async_list_page(monkeypatch):
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+    sync_calls = []
+    calls = []
+    expected = ([{"name": "group/repo1:-:README.md", "type": "file"}], 3)
+
+    def run_sync(loop, func, *args, **kwargs):
+        sync_calls.append({"loop": loop, "func": func.__name__})
+        return asyncio.run(func(*args, **kwargs))
+
+    async def fake_list_page(path, detail=True, *, offset=0, limit=50, **kwargs):
+        calls.append(
+            {
+                "path": path,
+                "detail": detail,
+                "offset": offset,
+                "limit": limit,
+                "kwargs": kwargs,
+            }
+        )
+        return expected
+
+    monkeypatch.setattr(fs_module, "sync", run_sync)
+    fs._list_page = fake_list_page
+
+    try:
+        out = fs.list_page("group/repo1", detail=True, offset=2, limit=1, ref="main")
+    finally:
+        fs.close()
+
+    assert out == expected
+    assert sync_calls[0] == {"loop": fs.loop, "func": "fake_list_page"}
+    assert calls == [
+        {
+            "path": "group/repo1",
+            "detail": True,
+            "offset": 2,
+            "limit": 1,
+            "kwargs": {"ref": "main"},
+        }
+    ]
+
+
+def test_list_page_sync_wrapper_returns_real_page(monkeypatch):
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+
+    def run_sync(loop, func, *args, **kwargs):
+        return asyncio.run(func(*args, **kwargs))
+
+    monkeypatch.setattr(fs_module, "sync", run_sync)
+
+    try:
+        out, total_count = fs.list_page(
+            "group/repo1",
+            detail=False,
+            offset=1,
+            limit=1,
+            ref="main",
+        )
+    finally:
+        fs.close()
+
+    assert out == ["group/repo1:-:docs"]
+    assert total_count == 3
+    assert fs.client.project_page_calls == [
+        {
+            "repo_id": 1,
+            "subdir": "",
+            "ref": "main",
+            "page": 2,
+            "per_page": 1,
+        }
+    ]
 
 
 def test_sync_wrapper_smoke():

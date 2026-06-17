@@ -5,7 +5,7 @@ from typing import Optional
 import aiofiles
 
 import fsspec
-from fsspec.asyn import AsyncFileSystem
+from fsspec.asyn import AsyncFileSystem, sync
 from .async_lfs_file import AsyncLFSFile
 from .gitlab_client import GitLabClient
 from .utils import norm_inside
@@ -72,6 +72,13 @@ class GitLabARCFileSystem(AsyncFileSystem):
             None.
         """
         await self.client.close()
+
+    def close(self) -> None:
+        """Close the underlying GitLab client session from synchronous code."""
+        if self.asynchronous:
+            raise RuntimeError("Use _close() with asynchronous=True filesystems.")
+
+        sync(self.loop, self._close)
 
     async def _ensure_project_index(self, *, refresh: bool = False) -> None:
         """
@@ -492,6 +499,32 @@ class GitLabARCFileSystem(AsyncFileSystem):
             total_count = len(full)
             sliced = full[offset:offset + limit]
             return sliced if detail else [e["name"] for e in sliced], total_count
+
+    def list_page(
+        self,
+        path: str,
+        detail: bool = True,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+        **kwargs,
+    ) -> tuple[list, int]:
+        """Return one paginated listing page from synchronous code.
+
+        This is the public synchronous wrapper around ``_list_page``.
+        """
+        if self.asynchronous:
+            raise RuntimeError("Use _list_page() with asynchronous=True filesystems.")
+
+        return sync(
+            self.loop,
+            self._list_page,
+            path,
+            detail,
+            offset=offset,
+            limit=limit,
+            **kwargs,
+        )
 
     async def _get_file(self, rpath, lpath, **kwargs):
         """
