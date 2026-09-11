@@ -11,6 +11,10 @@ from .gitlab_client import GitLabClient
 from .utils import norm_inside
 
 
+# GitLab caps ``per_page`` at 100 on the projects endpoint used for the root listing.
+PROJECTS_MAX_PER_PAGE = 100
+
+
 class GitLabARCFileSystem(AsyncFileSystem):
     """
     fsspec filesystem for GitLab repositories.
@@ -439,59 +443,72 @@ class GitLabARCFileSystem(AsyncFileSystem):
         if offset < 0:
             raise ValueError("offset must be >= 0")
 
-        # Backend paging is page/per_page based, so only aligned offsets map cleanly.
-        if offset % limit != 0:
-            full = await self._ls(path, detail=True, **kwargs)
-            total_count = len(full)
-            sliced = full[offset:offset + limit]
-            return (sliced if detail else [e["name"] for e in sliced], total_count)
-
-        page = (offset // limit) + 1
-        per_page = limit
+        # Backend paging is page/per_page based, so serve the requested window by fetching the pages
+        # that cover it and slicing. Asking for per_page=limit only worked when the offset happened
+        # to be a multiple of the limit. The projects endpoint behind the root listing also caps
+        # per_page at 100 and silently returns a shorter page, so those windows may need more than
+        # one request; the repository tree endpoint honours larger values.
+        per_page = min(limit, PROJECTS_MAX_PER_PAGE) if path == "" else limit
+        first_page = (offset // per_page) + 1
+        last_page = ((offset + limit - 1) // per_page) + 1
+        start_in_first_page = offset - (first_page - 1) * per_page
 
         try:
             if path == "":
-                items, total_count = await self.client.retrieve_root_level_page(
-                    page=page,
-                    per_page=per_page,
-                    membership=bool(kwargs.get("membership", False)),
-                    archived=bool(kwargs.get("archived", False)),
-                    simple=bool(kwargs.get("simple", True)),
-                )
 
-                if total_count is None:
-                    raise RuntimeError("root paged listing has no total count")
+                async def fetch_page(page: int) -> tuple[list, int]:
+                    items, total_count = await self.client.retrieve_root_level_page(
+                        page=page,
+                        per_page=per_page,
+                        membership=bool(kwargs.get("membership", False)),
+                        archived=bool(kwargs.get("archived", False)),
+                        simple=bool(kwargs.get("simple", True)),
+                    )
 
-                out = [
-                    {
-                        "name": f"{repo['original_path']}{self.root_marker}",
-                        "type": "directory",
-                    }
-                    for repo in items
-                ]
-                return out if detail else [e["name"] for e in out], total_count
+                    if total_count is None:
+                        raise RuntimeError("root paged listing has no total count")
 
-            repo, inside = await self._resolve(path, refresh=refresh, **kwargs)
-            key = f"{repo['original_path']}{self.root_marker}"
+                    return [
+                        {
+                            "name": f"{repo['original_path']}{self.root_marker}",
+                            "type": "directory",
+                        }
+                        for repo in items
+                    ], total_count
 
-            items, total_count = await self.client.retrieve_project_level_page(
-                repo_id=repo["id"],
-                subdir=inside,
-                ref=kwargs.get("ref"),
-                page=page,
-                per_page=per_page,
-            )
+            else:
+                repo, inside = await self._resolve(path, refresh=refresh, **kwargs)
+                key = f"{repo['original_path']}{self.root_marker}"
 
-            if total_count is None:
-                raise RuntimeError("project paged listing has no total count")
+                async def fetch_page(page: int) -> tuple[list, int]:
+                    items, total_count = await self.client.retrieve_project_level_page(
+                        repo_id=repo["id"],
+                        subdir=inside,
+                        ref=kwargs.get("ref"),
+                        page=page,
+                        per_page=per_page,
+                    )
 
-            out = [
-                {
-                    "name": f"{key}{item['path']}",
-                    "type": "directory" if item.get("type") == "tree" else "file",
-                }
-                for item in items
-            ]
+                    if total_count is None:
+                        raise RuntimeError("project paged listing has no total count")
+
+                    return [
+                        {
+                            "name": f"{key}{item['path']}",
+                            "type": "directory" if item.get("type") == "tree" else "file",
+                        }
+                        for item in items
+                    ], total_count
+
+            collected: list = []
+            total_count = 0
+            for page in range(first_page, last_page + 1):
+                entries, total_count = await fetch_page(page)
+                collected.extend(entries)
+                if len(entries) < per_page:
+                    break
+
+            out = collected[start_in_first_page:start_in_first_page + limit]
             return out if detail else [e["name"] for e in out], total_count
 
         except Exception:

@@ -19,6 +19,7 @@ class FakeGitLabClient:
         self.project_by_path_calls: list[str] = []
         self.project_by_id_calls: list[int] = []
         self.project_page_calls: list[dict] = []
+        self.root_page_calls: list[dict] = []
         self.stream_calls: list[dict] = []
 
         self.projects = {
@@ -59,6 +60,14 @@ class FakeGitLabClient:
     async def retrieve_root_level(self, **kwargs):
         self.root_calls.append(dict(kwargs))
         return list(self.projects.values())
+
+    async def retrieve_root_level_page(self, *, page, per_page, **kwargs):
+        self.root_page_calls.append({"page": page, "per_page": per_page})
+        # GitLab caps per_page at 100 on the projects endpoint.
+        effective = min(per_page, 100)
+        items = list(self.projects.values())
+        start = (page - 1) * effective
+        return items[start:start + effective], len(items)
 
     async def retrieve_project_level(self, repo_id, subdir, *, ref="main", per_page=100):
         self.project_calls.append((repo_id, subdir, ref))
@@ -615,3 +624,91 @@ def test_sync_wrapper_smoke():
         }
     finally:
         asyncio.run(fs._close())
+
+
+def _paging_fs(monkeypatch, tree_entries):
+    """Filesystem wired to a fake client holding ``tree_entries`` under (1, "")."""
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+    fs.client.tree[(1, "")] = tree_entries
+
+    def run_sync(loop, func, *args, **kwargs):
+        return asyncio.run(func(*args, **kwargs))
+
+    monkeypatch.setattr(fs_module, "sync", run_sync)
+    return fs
+
+
+def test_list_page_serves_an_unaligned_window_from_pages(monkeypatch):
+    """An offset that is not a multiple of the limit must not fall back to a full listing."""
+    entries = [{"path": f"f{i:02d}.txt", "type": "blob"} for i in range(10)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, total_count = fs.list_page("group/repo1", detail=False, offset=3, limit=4, ref="main")
+    finally:
+        fs.close()
+
+    assert out == [
+        "group/repo1:-:f03.txt",
+        "group/repo1:-:f04.txt",
+        "group/repo1:-:f05.txt",
+        "group/repo1:-:f06.txt",
+    ]
+    assert total_count == 10
+    # Served from backend pages, not from a full listing of the directory.
+    assert fs.client.project_page_calls
+    assert fs.client.project_calls == []
+
+
+def test_list_page_assembles_root_windows_larger_than_the_projects_cap(monkeypatch):
+    """GitLab caps per_page at 100 on the projects endpoint, so a larger window needs two requests."""
+    fs = _paging_fs(monkeypatch, [])
+    fs.client.projects = {
+        f"group/repo{i:03d}": {"id": i + 1, "original_path": f"group/repo{i:03d}"} for i in range(250)
+    }
+
+    try:
+        out, total_count = fs.list_page("", detail=False, offset=0, limit=150)
+    finally:
+        fs.close()
+
+    assert len(out) == 150
+    assert len(set(out)) == 150, "pages must not repeat entries"
+    assert out[0] == "group/repo000:-:"
+    assert out[-1] == "group/repo149:-:"
+    assert total_count == 250
+    assert all(call["per_page"] <= 100 for call in fs.client.root_page_calls)
+    assert [call["page"] for call in fs.client.root_page_calls] == [1, 2]
+
+
+def test_list_page_keeps_one_request_for_a_large_tree_window(monkeypatch):
+    """The repository tree endpoint honours per_page above 100, so do not split those needlessly."""
+    entries = [{"path": f"f{i:03d}.txt", "type": "blob"} for i in range(250)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, _ = fs.list_page("group/repo1", detail=False, offset=0, limit=150, ref="main")
+    finally:
+        fs.close()
+
+    assert len(out) == 150
+    assert [call["per_page"] for call in fs.client.project_page_calls] == [150]
+
+
+def test_list_page_past_the_end_returns_empty_with_the_real_total(monkeypatch):
+    entries = [{"path": f"f{i:02d}.txt", "type": "blob"} for i in range(10)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, total_count = fs.list_page("group/repo1", detail=False, offset=50, limit=10, ref="main")
+    finally:
+        fs.close()
+
+    assert out == []
+    assert total_count == 10
