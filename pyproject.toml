@@ -1,12 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "arcfs-fsspec"
-version = "0.1.9"
+version = "0.1.10"
 description = "GitLab ARC filesystem backend for fsspec"
-requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
 dependencies = [
   "aiofiles",
   "aiohttp",
