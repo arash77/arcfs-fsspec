@@ -141,7 +141,7 @@ def fs() -> GitLabARCFileSystem:
     fs.client = FakeGitLabClient()
     fs.repos = {}
     fs.not_repo = set()
-    fs.dircache = {}
+    fs.dircache.clear()
     fs._project_index_built = False
     fs._project_index_building = False
     return fs
@@ -884,3 +884,86 @@ def test_list_page_keeps_the_tightest_bound_across_pages(monkeypatch):
 
     assert len(out) == 50
     assert total_count == 150
+
+# ----------------------------------------------------------------------
+# fsspec cache options
+# ----------------------------------------------------------------------
+
+
+def _fs_with_cache_options(**options) -> GitLabARCFileSystem:
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=True,
+        skip_instance_cache=True,
+        **options,
+    )
+    fs.client = FakeGitLabClient()
+    return fs
+
+
+def test_cache_options_reach_the_cache():
+    """fsspec builds the cache from these, so they have to survive __init__."""
+    fs = _fs_with_cache_options(
+        use_listings_cache=False, listings_expiry_time=42, max_paths=7
+    )
+
+    assert fs.dircache.use_listings_cache is False
+    assert fs.dircache.listings_expiry_time == 42
+    assert fs.dircache.max_paths == 7
+
+
+def test_listings_cache_can_be_switched_off():
+    """With caching off the cache must keep nothing, and listing must still work."""
+    fs = _fs_with_cache_options(use_listings_cache=False)
+    fs.dircache["group/repo1:-:"] = [{"name": "group/repo1:-:x", "type": "file"}]
+
+    assert fs.dircache.get("group/repo1:-:") is None
+
+    first = asyncio.run(fs._ls("", detail=False))
+    second = asyncio.run(fs._ls("", detail=False))
+    assert first == second, "a listing must not depend on the cache holding anything"
+    assert first, "listing must still return entries with the cache disabled"
+
+
+def test_listings_are_cached_by_default():
+    """The default is unchanged: a second listing is served without asking GitLab again."""
+    fs = _fs_with_cache_options()
+
+    asyncio.run(fs._ls("", detail=False))
+    calls_after_first = len(fs.client.root_calls)
+    asyncio.run(fs._ls("", detail=False))
+
+    assert len(fs.client.root_calls) == calls_after_first, "second listing should be cached"
+
+
+def test_expired_listings_are_fetched_again():
+    """An expiry of zero makes every cached listing stale, so it must be fetched again."""
+    fs = _fs_with_cache_options(listings_expiry_time=0)
+
+    asyncio.run(fs._ls("group/repo1", detail=False))
+    calls_after_first = len(fs.client.project_calls)
+    asyncio.run(fs._ls("group/repo1", detail=False))
+
+    assert len(fs.client.project_calls) > calls_after_first, "expired listing should be refetched"
+
+
+def test_expiry_does_not_reach_the_root_project_index():
+    """The root listing is held twice, and the expiry only governs one of them.
+
+    The directory cache does expire, but the entries are rebuilt from ``self.repos``,
+    which ``_ensure_project_index`` keeps behind its own ``_project_index_built`` flag.
+    fsspec's options say nothing about that second cache, so the root is not refetched.
+    ``refresh=True`` is what rebuilds it.
+    """
+    fs = _fs_with_cache_options(listings_expiry_time=0)
+
+    asyncio.run(fs._ls("", detail=False))
+    calls_after_first = len(fs.client.root_calls)
+
+    asyncio.run(fs._ls("", detail=False))
+    assert fs.dircache.get("__root__") is None, "the directory cache should have expired"
+    assert len(fs.client.root_calls) == calls_after_first, "but the project index is reused"
+
+    asyncio.run(fs._ls("", detail=False, refresh=True))
+    assert len(fs.client.root_calls) > calls_after_first, "refresh rebuilds the index"
