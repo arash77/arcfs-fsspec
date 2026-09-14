@@ -11,6 +11,10 @@ from .gitlab_client import GitLabClient
 from .utils import norm_inside
 
 
+# GitLab REST pagination documents a maximum ``per_page`` of 100.
+GITLAB_MAX_PER_PAGE = 100
+
+
 class GitLabARCFileSystem(AsyncFileSystem):
     """
     fsspec filesystem for GitLab repositories.
@@ -426,12 +430,12 @@ class GitLabARCFileSystem(AsyncFileSystem):
 
         Returns:
             ``(entries, total_count)`` where ``entries`` is the requested page
-            and ``total_count`` is the total number of entries available.
-
-        Falls back to full async listing and in-memory slicing if backend paging
-        cannot be used cleanly.
+            and ``total_count`` is the total number of entries available when
+            GitLab reports one, otherwise a lower bound that grows as the caller
+            pages. Only the backend pages covering the requested window are
+            fetched; errors are raised rather than retried as a full listing.
         """
-        refresh = bool(kwargs.get("refresh", False))
+        refresh = bool(kwargs.pop("refresh", False))
         path = (path or "").strip().strip("/")
 
         if limit <= 0:
@@ -439,18 +443,20 @@ class GitLabARCFileSystem(AsyncFileSystem):
         if offset < 0:
             raise ValueError("offset must be >= 0")
 
-        # Backend paging is page/per_page based, so only aligned offsets map cleanly.
-        if offset % limit != 0:
-            full = await self._ls(path, detail=True, **kwargs)
-            total_count = len(full)
-            sliced = full[offset:offset + limit]
-            return (sliced if detail else [e["name"] for e in sliced], total_count)
+        # Backend paging is page/per_page based, so serve the requested window by fetching the pages
+        # that cover it and slicing. Asking for per_page=limit only worked when the offset happened
+        # to be a multiple of the limit. The projects endpoint behind the root listing also caps
+        # per_page at 100 and silently returns a shorter page, so those windows may need more than
+        # one request. The repository tree endpoint honours larger values on the tested GitLab
+        # version, but GitLab documents 100 as the general maximum, so cap both endpoints.
+        per_page = min(limit, GITLAB_MAX_PER_PAGE)
+        first_page = (offset // per_page) + 1
+        last_page = ((offset + limit - 1) // per_page) + 1
+        start_in_first_page = offset - (first_page - 1) * per_page
 
-        page = (offset // limit) + 1
-        per_page = limit
+        if path == "":
 
-        try:
-            if path == "":
+            async def fetch_page(page: int) -> tuple[list, int]:
                 items, total_count = await self.client.retrieve_root_level_page(
                     page=page,
                     per_page=per_page,
@@ -459,46 +465,49 @@ class GitLabARCFileSystem(AsyncFileSystem):
                     simple=bool(kwargs.get("simple", True)),
                 )
 
-                if total_count is None:
-                    raise RuntimeError("root paged listing has no total count")
-
-                out = [
+                return [
                     {
                         "name": f"{repo['original_path']}{self.root_marker}",
                         "type": "directory",
                     }
                     for repo in items
-                ]
-                return out if detail else [e["name"] for e in out], total_count
+                ], total_count
 
+        else:
             repo, inside = await self._resolve(path, refresh=refresh, **kwargs)
             key = f"{repo['original_path']}{self.root_marker}"
 
-            items, total_count = await self.client.retrieve_project_level_page(
-                repo_id=repo["id"],
-                subdir=inside,
-                ref=kwargs.get("ref"),
-                page=page,
-                per_page=per_page,
-            )
+            async def fetch_page(page: int) -> tuple[list, int]:
+                items, total_count = await self.client.retrieve_project_level_page(
+                    repo_id=repo["id"],
+                    subdir=inside,
+                    ref=kwargs.get("ref"),
+                    page=page,
+                    per_page=per_page,
+                )
 
-            if total_count is None:
-                raise RuntimeError("project paged listing has no total count")
+                return [
+                    {
+                        "name": f"{key}{item['path']}",
+                        "type": "directory" if item.get("type") == "tree" else "file",
+                    }
+                    for item in items
+                ], total_count
 
-            out = [
-                {
-                    "name": f"{key}{item['path']}",
-                    "type": "directory" if item.get("type") == "tree" else "file",
-                }
-                for item in items
-            ]
-            return out if detail else [e["name"] for e in out], total_count
+        collected: list = []
+        total_count = 0
+        for page in range(first_page, last_page + 1):
+            entries, page_total = await fetch_page(page)
+            collected.extend(entries)
+            # Keep the tightest count seen. Without an exact total each page
+            # reports only a lower bound, and a later, emptier page reports a
+            # looser one than a full page already did.
+            total_count = max(total_count, page_total)
+            if len(entries) < per_page:
+                break
 
-        except Exception:
-            full = await self._ls(path, detail=True, **kwargs)
-            total_count = len(full)
-            sliced = full[offset:offset + limit]
-            return sliced if detail else [e["name"] for e in sliced], total_count
+        out = collected[start_in_first_page:start_in_first_page + limit]
+        return out if detail else [e["name"] for e in out], total_count
 
     def list_page(
         self,
@@ -579,7 +588,7 @@ class GitLabARCFileSystem(AsyncFileSystem):
         Returns:
             None.
         """
-        refresh = bool(kwargs.get("refresh", False))
+        refresh = bool(kwargs.pop("refresh", False))
 
         repo, inside = await self._resolve(
             rpath,

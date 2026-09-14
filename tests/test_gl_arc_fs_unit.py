@@ -8,6 +8,7 @@ import arcfs.async_lfs_file as async_lfs_file_module
 import arcfs.fs as fs_module
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
+from arcfs.gitlab_client import GitLabClient
 
 
 class FakeGitLabClient:
@@ -19,6 +20,7 @@ class FakeGitLabClient:
         self.project_by_path_calls: list[str] = []
         self.project_by_id_calls: list[int] = []
         self.project_page_calls: list[dict] = []
+        self.root_page_calls: list[dict] = []
         self.stream_calls: list[dict] = []
 
         self.projects = {
@@ -59,6 +61,14 @@ class FakeGitLabClient:
     async def retrieve_root_level(self, **kwargs):
         self.root_calls.append(dict(kwargs))
         return list(self.projects.values())
+
+    async def retrieve_root_level_page(self, *, page, per_page, **kwargs):
+        self.root_page_calls.append({"page": page, "per_page": per_page})
+        # GitLab caps per_page at 100 on the projects endpoint.
+        effective = min(per_page, 100)
+        items = list(self.projects.values())
+        start = (page - 1) * effective
+        return items[start:start + effective], len(items)
 
     async def retrieve_project_level(self, repo_id, subdir, *, ref="main", per_page=100):
         self.project_calls.append((repo_id, subdir, ref))
@@ -615,3 +625,247 @@ def test_sync_wrapper_smoke():
         }
     finally:
         asyncio.run(fs._close())
+
+
+def _paging_fs(monkeypatch, tree_entries):
+    """Filesystem wired to a fake client holding ``tree_entries`` under (1, "")."""
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+    fs.client.tree[(1, "")] = tree_entries
+
+    def run_sync(loop, func, *args, **kwargs):
+        return asyncio.run(func(*args, **kwargs))
+
+    monkeypatch.setattr(fs_module, "sync", run_sync)
+    return fs
+
+
+def test_list_page_serves_an_unaligned_window_from_pages(monkeypatch):
+    """An offset that is not a multiple of the limit must not fall back to a full listing."""
+    entries = [{"path": f"f{i:02d}.txt", "type": "blob"} for i in range(10)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, total_count = fs.list_page("group/repo1", detail=False, offset=3, limit=4, ref="main")
+    finally:
+        fs.close()
+
+    assert out == [
+        "group/repo1:-:f03.txt",
+        "group/repo1:-:f04.txt",
+        "group/repo1:-:f05.txt",
+        "group/repo1:-:f06.txt",
+    ]
+    assert total_count == 10
+    # Served from backend pages, not from a full listing of the directory.
+    assert fs.client.project_page_calls
+    assert fs.client.project_calls == []
+
+
+def test_list_page_assembles_root_windows_larger_than_the_projects_cap(monkeypatch):
+    """GitLab caps per_page at 100 on the projects endpoint, so a larger window needs two requests."""
+    fs = _paging_fs(monkeypatch, [])
+    fs.client.projects = {
+        f"group/repo{i:03d}": {"id": i + 1, "original_path": f"group/repo{i:03d}"} for i in range(250)
+    }
+
+    try:
+        out, total_count = fs.list_page("", detail=False, offset=0, limit=150)
+    finally:
+        fs.close()
+
+    assert len(out) == 150
+    assert len(set(out)) == 150, "pages must not repeat entries"
+    assert out[0] == "group/repo000:-:"
+    assert out[-1] == "group/repo149:-:"
+    assert total_count == 250
+    assert all(call["per_page"] <= 100 for call in fs.client.root_page_calls)
+    assert [call["page"] for call in fs.client.root_page_calls] == [1, 2]
+
+
+def test_list_page_assembles_large_tree_window_from_capped_pages(monkeypatch):
+    """Keep tree page requests within GitLab's documented maximum."""
+    entries = [{"path": f"f{i:03d}.txt", "type": "blob"} for i in range(250)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, _ = fs.list_page("group/repo1", detail=False, offset=0, limit=150, ref="main")
+    finally:
+        fs.close()
+
+    assert len(out) == 150
+    assert [call["per_page"] for call in fs.client.project_page_calls] == [100, 100]
+
+
+def test_list_page_past_the_end_returns_empty_with_the_real_total(monkeypatch):
+    entries = [{"path": f"f{i:02d}.txt", "type": "blob"} for i in range(10)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, total_count = fs.list_page("group/repo1", detail=False, offset=50, limit=10, ref="main")
+    finally:
+        fs.close()
+
+    assert out == []
+    assert total_count == 10
+
+
+# ----------------------------------------------------------------------
+# Totals when GitLab does not send X-Total
+#
+# GitLab drops X-Total once a query would return more than 10,000 records, so
+# large instances omit it on exactly the listings that are most expensive to
+# count. These are pure header tests against the real client.
+# ----------------------------------------------------------------------
+
+
+def _client():
+    return GitLabClient("https://example.invalid", "token")
+
+
+def test_total_or_bound_prefers_an_exact_total():
+    """An exact X-Total always wins, whatever the other headers say."""
+    headers = {"X-Total": "251", "X-Next-Page": "2", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 251
+
+
+def test_total_or_bound_reports_a_lower_bound_while_pages_follow():
+    """Without a total, report what has been seen plus one so the caller keeps paging."""
+    headers = {"X-Next-Page": "2", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 26
+    assert _client()._total_or_bound(headers, page=4, per_page=25, item_count=25) == 101
+
+
+def test_total_or_bound_is_exact_on_the_last_page():
+    """An empty X-Next-Page means this is the last page, so the count is exact."""
+    headers = {"X-Next-Page": "", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=3, per_page=25, item_count=7) == 57
+
+
+def test_total_or_bound_follows_the_link_header_when_x_next_page_is_absent():
+    """Either signal is enough; an instance may send only Link."""
+    link = '<https://example.invalid/api/v4/projects?page=2>; rel="next"'
+    headers = {"Link": link, "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 26
+
+    headers = {"Link": '<https://example.invalid/api/v4/projects?page=1>; rel="first"'}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 25
+
+
+def test_total_or_bound_reads_the_applied_per_page():
+    """GitLab caps per_page and reports what it used, so trust the header over the request."""
+    headers = {"X-Next-Page": "", "X-Per-Page": "100"}
+    # 500 was requested, 100 applied: page 2 means 100 already seen, not 500.
+    assert _client()._total_or_bound(headers, page=2, per_page=500, item_count=100) == 200
+
+
+def test_total_or_bound_treats_an_unparseable_total_as_missing():
+    """A garbage X-Total must degrade to the bound, not raise."""
+    headers = {"X-Total": "not-a-number", "X-Next-Page": "2", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 26
+
+
+def test_total_or_bound_assumes_more_when_the_server_sends_no_signal():
+    """With no total and no next-page signal, over-report rather than hide entries.
+
+    Under-reporting would tell the caller the listing ends here, and a consumer
+    that only offers paging when the total exceeds one page would then make
+    every later entry unreachable.
+    """
+    headers = {"X-Per-Page": "25"}
+    with pytest.warns(RuntimeWarning):
+        full_page = _client()._total_or_bound(headers, page=1, per_page=25, item_count=25)
+    assert full_page == 26
+
+    with pytest.warns(RuntimeWarning):
+        short_page = _client()._total_or_bound(headers, page=1, per_page=25, item_count=7)
+    assert short_page == 7
+
+
+def test_list_page_with_refresh_uses_the_paged_path(monkeypatch):
+    """refresh=True must not disable paging.
+
+    refresh was read with ``kwargs.get``, so it stayed in kwargs and was passed
+    to _resolve both explicitly and through the splat. That raised TypeError,
+    which the removed catch-all turned into a silent whole-listing fetch.
+    """
+    entries = [{"path": f"f{i:02d}.txt", "type": "blob"} for i in range(10)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, total_count = fs.list_page(
+            "group/repo1", detail=False, offset=0, limit=4, ref="main", refresh=True
+        )
+    finally:
+        fs.close()
+
+    assert len(out) == 4
+    assert total_count == 10
+    assert fs.client.project_page_calls, "refresh=True must still use the paged endpoint"
+    assert fs.client.project_calls == [], "the whole-listing path must not be used"
+
+
+def test_put_file_with_refresh_reaches_the_upload(monkeypatch, tmp_path):
+    """refresh=True must not break uploads.
+
+    _put_file had the same double-pass as _list_page: refresh was read with
+    ``kwargs.get`` and then handed to _resolve both explicitly and through the
+    splat. Unlike the listing path there was no catch-all here, so it raised.
+    """
+    fs = _paging_fs(monkeypatch, [])
+    calls = []
+
+    async def fake_upload(**kwargs):
+        calls.append(kwargs)
+
+    fs.client.upload_file_lfs = fake_upload
+
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+
+    fs.put_file(str(local), "group/repo1:-:assays/payload.txt", refresh=True)
+
+    assert len(calls) == 1, "the upload must actually be reached"
+    assert calls[0]["final_path"] == "assays/payload.txt"
+
+
+def test_total_or_bound_reports_nothing_for_a_page_past_the_end():
+    """An empty page must not be read as a count.
+
+    ``(page - 1) * per_page`` is the offset the CALLER chose, so treating it as
+    a total turns any large offset into a phantom count of entries that do not
+    exist. Without an exact total an empty page supports no lower bound at all.
+    """
+    headers = {"X-Page": "21", "X-Per-Page": "100", "X-Next-Page": ""}
+    assert _client()._total_or_bound(headers, page=21, per_page=100, item_count=0) == 0
+    assert _client()._total_or_bound(headers, page=1001, per_page=100, item_count=0) == 0
+
+    # An exact total is still honoured for the same empty page.
+    exact = {"X-Total": "1500", "X-Page": "21", "X-Per-Page": "100"}
+    assert _client()._total_or_bound(exact, page=21, per_page=100, item_count=0) == 1500
+
+
+def test_list_page_keeps_the_tightest_bound_across_pages(monkeypatch):
+    """A window whose last page is empty must keep the bound an earlier page gave.
+
+    Reporting only the final page's value would throw away what the full pages
+    already proved and collapse the total to zero.
+    """
+    entries = [{"path": f"f{i:04d}.txt", "type": "blob"} for i in range(150)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        # Spans page 2 (50 real entries) and page 3 (empty).
+        out, total_count = fs.list_page(
+            "group/repo1", detail=False, offset=100, limit=200, ref="main"
+        )
+    finally:
+        fs.close()
+
+    assert len(out) == 50
+    assert total_count == 150

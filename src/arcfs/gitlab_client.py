@@ -242,15 +242,112 @@ class GitLabClient:
         """
         Parse GitLab's ``X-Total`` pagination header.
 
+        GitLab omits this header once a query would return more than 10,000
+        records, so its absence is normal on large instances rather than an
+        error.
+
         Args:
             headers: Mapping-like response headers from aiohttp.
 
         Returns:
-            Total item count as ``int`` when GitLab supplies it, otherwise
-            ``None``.
+            Total item count as ``int`` when GitLab supplies a numeric value,
+            otherwise ``None``.
         """
-        total_raw = headers.get("X-Total") or ""
-        return int(total_raw) if total_raw else None
+        total_raw = (self._normalized_headers(headers).get("x-total") or "").strip()
+        if not total_raw:
+            return None
+        try:
+            return int(total_raw)
+        except ValueError:
+            return None
+
+    def _has_next_page(self, headers, item_count: int, per_page: int) -> bool:
+        """
+        Report whether GitLab says another page follows this one.
+
+        Both ``X-Next-Page`` and the ``Link`` header are consulted, because an
+        instance may send either. When a server sends neither, the page is
+        assumed to be full-means-more: under-reporting would tell a caller the
+        listing ends here and hide every later entry, while over-reporting only
+        costs one empty request.
+
+        Args:
+            headers: Mapping-like response headers from aiohttp.
+            item_count: Number of entries returned in this page.
+            per_page: Page size actually applied by the server.
+
+        Returns:
+            True when another page follows, otherwise False.
+        """
+        h = self._normalized_headers(headers)
+        if (h.get("x-next-page") or "").strip():
+            return True
+        if "x-next-page" in h or "link" in h:
+            return self._extract_next_link(h.get("link")) is not None
+
+        warnings.warn(
+            "list_page: no X-Total, X-Next-Page or Link header; assuming a full page "
+            "means more entries follow",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return item_count >= per_page
+
+    def _applied_per_page(self, headers, per_page: int) -> int:
+        """
+        Return the page size GitLab actually applied.
+
+        GitLab caps ``per_page`` and reports what it used in ``X-Per-Page``, so
+        a request for more than the maximum silently receives a shorter page.
+        Trusting the requested value would overstate how much has been seen.
+
+        Args:
+            headers: Mapping-like response headers from aiohttp.
+            per_page: Page size that was requested.
+
+        Returns:
+            The applied page size, falling back to ``per_page``.
+        """
+        raw = (self._normalized_headers(headers).get("x-per-page") or "").strip()
+        try:
+            applied = int(raw)
+        except ValueError:
+            return per_page
+        return applied if applied > 0 else per_page
+
+    def _total_or_bound(self, headers, page: int, per_page: int, item_count: int) -> int:
+        """
+        Return GitLab's exact total, or a lower bound when it supplies none.
+
+        An exact ``X-Total`` always wins. Otherwise the count of entries up to
+        and including this page is used, plus one while another page follows.
+        That trailing ``+1`` is load-bearing for callers that compare the total
+        against what they received to decide whether more entries exist, so
+        simplifying it away would make a truncated listing look complete.
+
+        Args:
+            headers: Mapping-like response headers from aiohttp.
+            page: One-based page number just fetched.
+            per_page: Page size that was requested.
+            item_count: Number of entries returned in this page.
+
+        Returns:
+            The exact total when known, otherwise a lower bound.
+        """
+        exact = self._parse_total_count(headers)
+        if exact is not None:
+            return exact
+
+        if not item_count:
+            # An empty page means the requested offset is past the end. It says
+            # nothing about how many entries exist, and ``(page - 1) * per_page``
+            # would be the caller's own offset: an upper bound, not a lower one,
+            # and unbounded in the offset the caller chose.
+            return 0
+
+        applied = self._applied_per_page(headers, per_page)
+        seen = (page - 1) * applied + item_count
+        return seen + 1 if self._has_next_page(headers, item_count, applied) else seen
 
     def _warn_offset_fallback(self, scope: str, reason: str) -> None:
         """
@@ -670,7 +767,7 @@ class GitLabClient:
         membership: bool = False,
         archived: bool = False,
         simple: bool = True,
-    ) -> tuple[list[dict[str, Any]], int | None]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """
         Retrieve exactly one offset-based page from /projects.
 
@@ -683,8 +780,9 @@ class GitLabClient:
 
         Returns:
             ``(items, total_count)`` where ``items`` is a list of normalized
-            project dicts and ``total_count`` is the ``X-Total`` value, or
-            ``None`` if GitLab did not return it.
+            project dicts and ``total_count`` is GitLab's ``X-Total`` when it
+            supplies one, otherwise a lower bound covering the pages seen so
+            far. See ``_total_or_bound``.
         """
         if page < 1:
             raise ValueError("page must be >= 1")
@@ -705,7 +803,7 @@ class GitLabClient:
             r.raise_for_status()
             data = await r.json()
             items = self._normalize_projects(data)
-            total_count = self._parse_total_count(r.headers)
+            total_count = self._total_or_bound(r.headers, page, per_page, len(items))
             return items, total_count
 
     # ------------------------------------------------------------------
@@ -835,7 +933,7 @@ class GitLabClient:
         ref: str | None = None,
         page: int = 1,
         per_page: int = 100,
-    ) -> tuple[list[dict[str, Any]], int | None]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """
         Retrieve exactly one offset-based page from /repository/tree.
 
@@ -848,9 +946,10 @@ class GitLabClient:
             per_page: Number of tree entries requested for the page.
 
         Returns:
-            ``(items, total_count)`` where ``items`` is a list of raw tree entry
-            dicts and ``total_count`` is the ``X-Total`` value, or ``None`` if
-            GitLab did not return it.
+            ``(items, total_count)`` where ``items`` is a list of raw tree
+            entry dicts and ``total_count`` is GitLab's ``X-Total`` when it
+            supplies one, otherwise a lower bound covering the pages seen so
+            far. See ``_total_or_bound``.
         """
         if page < 1:
             raise ValueError("page must be >= 1")
@@ -875,7 +974,7 @@ class GitLabClient:
             r.raise_for_status()
 
             items = await r.json()
-            total_count = self._parse_total_count(r.headers)
+            total_count = self._total_or_bound(r.headers, page, per_page, len(items))
             return items, total_count
 
     # ------------------------------------------------------------------
