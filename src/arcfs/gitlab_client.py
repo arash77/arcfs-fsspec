@@ -170,7 +170,7 @@ class GitLabClient:
         params: dict[str, Any] = {
             "page": int(page),
             "per_page": int(per_page),
-            "order_by": "last_activity_at",
+            "order_by": "id",
             "sort": "desc",
             "membership": str(bool(membership)).lower(),
             "archived": str(bool(archived)).lower(),

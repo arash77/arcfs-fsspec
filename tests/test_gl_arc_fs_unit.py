@@ -8,6 +8,7 @@ import arcfs.async_lfs_file as async_lfs_file_module
 import arcfs.fs as fs_module
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
+from arcfs.gitlab_client import GitLabClient
 
 
 class FakeGitLabClient:
@@ -139,6 +140,21 @@ def fs() -> GitLabARCFileSystem:
 
 def names(entries: Iterable[dict]) -> list[str]:
     return [entry["name"] for entry in entries]
+
+
+def test_root_params_order_projects_by_descending_id():
+    client = GitLabClient("https://example.invalid", "token")
+
+    params = client._build_root_params(
+        page=1,
+        per_page=100,
+        membership=False,
+        archived=False,
+        simple=True,
+    )
+
+    assert params["order_by"] == "id"
+    assert params["sort"] == "desc"
 
 
 @pytest.fixture
