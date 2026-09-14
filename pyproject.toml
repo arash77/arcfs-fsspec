@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arcfs-fsspec"
-version = "0.1.10"
+version = "0.1.11"
 description = "GitLab ARC filesystem backend for fsspec"
 license = "MIT"
 license-files = ["LICENSE"]
