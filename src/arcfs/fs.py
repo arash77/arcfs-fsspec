@@ -61,9 +61,6 @@ class GitLabARCFileSystem(AsyncFileSystem):
         # Negative cache for failed raw-prefix probes
         self.not_repo: set[str] = set()
 
-        # fsspec directory cache
-        self.dircache: dict[str, list[dict]] = {}
-
         # Root index state
         self._project_index_built: bool = False
         self._project_index_building: bool = False
@@ -365,17 +362,21 @@ class GitLabARCFileSystem(AsyncFileSystem):
         if path == "":
             cache_key = "__root__"
 
-            if refresh or cache_key not in self.dircache:
+            out = None if refresh else self.dircache.get(cache_key)
+            if out is None:
                 await self._ensure_project_index(refresh=refresh)
-                self.dircache[cache_key] = [
+                out = [
                     {
                         "name": f"{repo['original_path']}{self.root_marker}",
                         "type": "directory",
                     }
                     for repo in self.repos.values()
                 ]
+                # Return what was just built rather than reading it back. The cache
+                # may be configured to keep nothing (use_listings_cache=False) or to
+                # expire entries, in which case reading it back would raise.
+                self.dircache[cache_key] = out
 
-            out = self.dircache[cache_key]
             return out if detail else [e["name"] for e in out]
 
         repo, inside = await self._resolve(
@@ -385,7 +386,8 @@ class GitLabARCFileSystem(AsyncFileSystem):
         key = f"{repo['original_path']}{self.root_marker}"
         cache_key = f"{key}/{inside}" if inside else key
 
-        if refresh or cache_key not in self.dircache:
+        out = None if refresh else self.dircache.get(cache_key)
+        if out is None:
             ref = kwargs.get("ref")
             if ref is None:
                 ref = await self.client.get_default_branch(repo["id"])
@@ -395,15 +397,15 @@ class GitLabARCFileSystem(AsyncFileSystem):
                 inside,
                 ref=ref,
             )
-            self.dircache[cache_key] = [
+            out = [
                 {
                     "name": f"{key}{i['path']}",
                     "type": "directory" if i.get("type") == "tree" else "file",
                 }
                 for i in items
             ]
+            self.dircache[cache_key] = out
 
-        out = self.dircache[cache_key]
         return out if detail else [e["name"] for e in out]
 
     async def _list_page(
