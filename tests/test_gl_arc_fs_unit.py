@@ -687,8 +687,8 @@ def test_list_page_assembles_root_windows_larger_than_the_projects_cap(monkeypat
     assert [call["page"] for call in fs.client.root_page_calls] == [1, 2]
 
 
-def test_list_page_keeps_one_request_for_a_large_tree_window(monkeypatch):
-    """The repository tree endpoint honours per_page above 100, so do not split those needlessly."""
+def test_list_page_assembles_large_tree_window_from_capped_pages(monkeypatch):
+    """Keep tree page requests within GitLab's documented maximum."""
     entries = [{"path": f"f{i:03d}.txt", "type": "blob"} for i in range(250)]
     fs = _paging_fs(monkeypatch, entries)
 
@@ -698,7 +698,7 @@ def test_list_page_keeps_one_request_for_a_large_tree_window(monkeypatch):
         fs.close()
 
     assert len(out) == 150
-    assert [call["per_page"] for call in fs.client.project_page_calls] == [150]
+    assert [call["per_page"] for call in fs.client.project_page_calls] == [100, 100]
 
 
 def test_list_page_past_the_end_returns_empty_with_the_real_total(monkeypatch):

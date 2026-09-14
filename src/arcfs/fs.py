@@ -11,8 +11,8 @@ from .gitlab_client import GitLabClient
 from .utils import norm_inside
 
 
-# GitLab caps ``per_page`` at 100 on the projects endpoint used for the root listing.
-PROJECTS_MAX_PER_PAGE = 100
+# GitLab REST pagination documents a maximum ``per_page`` of 100.
+GITLAB_MAX_PER_PAGE = 100
 
 
 class GitLabARCFileSystem(AsyncFileSystem):
@@ -447,8 +447,9 @@ class GitLabARCFileSystem(AsyncFileSystem):
         # that cover it and slicing. Asking for per_page=limit only worked when the offset happened
         # to be a multiple of the limit. The projects endpoint behind the root listing also caps
         # per_page at 100 and silently returns a shorter page, so those windows may need more than
-        # one request; the repository tree endpoint honours larger values.
-        per_page = min(limit, PROJECTS_MAX_PER_PAGE) if path == "" else limit
+        # one request. The repository tree endpoint honours larger values on the tested GitLab
+        # version, but GitLab documents 100 as the general maximum, so cap both endpoints.
+        per_page = min(limit, GITLAB_MAX_PER_PAGE)
         first_page = (offset // per_page) + 1
         last_page = ((offset + limit - 1) // per_page) + 1
         start_in_first_page = offset - (first_page - 1) * per_page
