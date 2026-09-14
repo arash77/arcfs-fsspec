@@ -8,6 +8,7 @@ import arcfs.async_lfs_file as async_lfs_file_module
 import arcfs.fs as fs_module
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
+from arcfs.gitlab_client import GitLabClient
 
 
 class FakeGitLabClient:
@@ -713,6 +714,79 @@ def test_list_page_past_the_end_returns_empty_with_the_real_total(monkeypatch):
     assert out == []
     assert total_count == 10
 
+
+# ----------------------------------------------------------------------
+# Totals when GitLab does not send X-Total
+#
+# GitLab drops X-Total once a query would return more than 10,000 records, so
+# large instances omit it on exactly the listings that are most expensive to
+# count. These are pure header tests against the real client.
+# ----------------------------------------------------------------------
+
+
+def _client():
+    return GitLabClient("https://example.invalid", "token")
+
+
+def test_total_or_bound_prefers_an_exact_total():
+    """An exact X-Total always wins, whatever the other headers say."""
+    headers = {"X-Total": "251", "X-Next-Page": "2", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 251
+
+
+def test_total_or_bound_reports_a_lower_bound_while_pages_follow():
+    """Without a total, report what has been seen plus one so the caller keeps paging."""
+    headers = {"X-Next-Page": "2", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 26
+    assert _client()._total_or_bound(headers, page=4, per_page=25, item_count=25) == 101
+
+
+def test_total_or_bound_is_exact_on_the_last_page():
+    """An empty X-Next-Page means this is the last page, so the count is exact."""
+    headers = {"X-Next-Page": "", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=3, per_page=25, item_count=7) == 57
+
+
+def test_total_or_bound_follows_the_link_header_when_x_next_page_is_absent():
+    """Either signal is enough; an instance may send only Link."""
+    link = '<https://example.invalid/api/v4/projects?page=2>; rel="next"'
+    headers = {"Link": link, "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 26
+
+    headers = {"Link": '<https://example.invalid/api/v4/projects?page=1>; rel="first"'}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 25
+
+
+def test_total_or_bound_reads_the_applied_per_page():
+    """GitLab caps per_page and reports what it used, so trust the header over the request."""
+    headers = {"X-Next-Page": "", "X-Per-Page": "100"}
+    # 500 was requested, 100 applied: page 2 means 100 already seen, not 500.
+    assert _client()._total_or_bound(headers, page=2, per_page=500, item_count=100) == 200
+
+
+def test_total_or_bound_treats_an_unparseable_total_as_missing():
+    """A garbage X-Total must degrade to the bound, not raise."""
+    headers = {"X-Total": "not-a-number", "X-Next-Page": "2", "X-Per-Page": "25"}
+    assert _client()._total_or_bound(headers, page=1, per_page=25, item_count=25) == 26
+
+
+def test_total_or_bound_assumes_more_when_the_server_sends_no_signal():
+    """With no total and no next-page signal, over-report rather than hide entries.
+
+    Under-reporting would tell the caller the listing ends here, and a consumer
+    that only offers paging when the total exceeds one page would then make
+    every later entry unreachable.
+    """
+    headers = {"X-Per-Page": "25"}
+    with pytest.warns(RuntimeWarning):
+        full_page = _client()._total_or_bound(headers, page=1, per_page=25, item_count=25)
+    assert full_page == 26
+
+    with pytest.warns(RuntimeWarning):
+        short_page = _client()._total_or_bound(headers, page=1, per_page=25, item_count=7)
+    assert short_page == 7
+
+
 def test_list_page_with_refresh_uses_the_paged_path(monkeypatch):
     """refresh=True must not disable paging.
 
@@ -734,6 +808,7 @@ def test_list_page_with_refresh_uses_the_paged_path(monkeypatch):
     assert total_count == 10
     assert fs.client.project_page_calls, "refresh=True must still use the paged endpoint"
     assert fs.client.project_calls == [], "the whole-listing path must not be used"
+
 
 def test_put_file_with_refresh_reaches_the_upload(monkeypatch, tmp_path):
     """refresh=True must not break uploads.
@@ -757,3 +832,40 @@ def test_put_file_with_refresh_reaches_the_upload(monkeypatch, tmp_path):
 
     assert len(calls) == 1, "the upload must actually be reached"
     assert calls[0]["final_path"] == "assays/payload.txt"
+
+
+def test_total_or_bound_reports_nothing_for_a_page_past_the_end():
+    """An empty page must not be read as a count.
+
+    ``(page - 1) * per_page`` is the offset the CALLER chose, so treating it as
+    a total turns any large offset into a phantom count of entries that do not
+    exist. Without an exact total an empty page supports no lower bound at all.
+    """
+    headers = {"X-Page": "21", "X-Per-Page": "100", "X-Next-Page": ""}
+    assert _client()._total_or_bound(headers, page=21, per_page=100, item_count=0) == 0
+    assert _client()._total_or_bound(headers, page=1001, per_page=100, item_count=0) == 0
+
+    # An exact total is still honoured for the same empty page.
+    exact = {"X-Total": "1500", "X-Page": "21", "X-Per-Page": "100"}
+    assert _client()._total_or_bound(exact, page=21, per_page=100, item_count=0) == 1500
+
+
+def test_list_page_keeps_the_tightest_bound_across_pages(monkeypatch):
+    """A window whose last page is empty must keep the bound an earlier page gave.
+
+    Reporting only the final page's value would throw away what the full pages
+    already proved and collapse the total to zero.
+    """
+    entries = [{"path": f"f{i:04d}.txt", "type": "blob"} for i in range(150)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        # Spans page 2 (50 real entries) and page 3 (empty).
+        out, total_count = fs.list_page(
+            "group/repo1", detail=False, offset=100, limit=200, ref="main"
+        )
+    finally:
+        fs.close()
+
+    assert len(out) == 50
+    assert total_count == 150
