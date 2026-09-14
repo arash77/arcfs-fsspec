@@ -151,6 +151,21 @@ def names(entries: Iterable[dict]) -> list[str]:
     return [entry["name"] for entry in entries]
 
 
+def test_root_params_order_projects_by_descending_id():
+    client = GitLabClient("https://example.invalid", "token")
+
+    params = client._build_root_params(
+        page=1,
+        per_page=100,
+        membership=False,
+        archived=False,
+        simple=True,
+    )
+
+    assert params["order_by"] == "id"
+    assert params["sort"] == "desc"
+
+
 @pytest.fixture
 def fake_lfs_tempfile(monkeypatch):
     class FakeAsyncTempFile:
