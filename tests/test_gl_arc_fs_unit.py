@@ -712,3 +712,48 @@ def test_list_page_past_the_end_returns_empty_with_the_real_total(monkeypatch):
 
     assert out == []
     assert total_count == 10
+
+def test_list_page_with_refresh_uses_the_paged_path(monkeypatch):
+    """refresh=True must not disable paging.
+
+    refresh was read with ``kwargs.get``, so it stayed in kwargs and was passed
+    to _resolve both explicitly and through the splat. That raised TypeError,
+    which the removed catch-all turned into a silent whole-listing fetch.
+    """
+    entries = [{"path": f"f{i:02d}.txt", "type": "blob"} for i in range(10)]
+    fs = _paging_fs(monkeypatch, entries)
+
+    try:
+        out, total_count = fs.list_page(
+            "group/repo1", detail=False, offset=0, limit=4, ref="main", refresh=True
+        )
+    finally:
+        fs.close()
+
+    assert len(out) == 4
+    assert total_count == 10
+    assert fs.client.project_page_calls, "refresh=True must still use the paged endpoint"
+    assert fs.client.project_calls == [], "the whole-listing path must not be used"
+
+def test_put_file_with_refresh_reaches_the_upload(monkeypatch, tmp_path):
+    """refresh=True must not break uploads.
+
+    _put_file had the same double-pass as _list_page: refresh was read with
+    ``kwargs.get`` and then handed to _resolve both explicitly and through the
+    splat. Unlike the listing path there was no catch-all here, so it raised.
+    """
+    fs = _paging_fs(monkeypatch, [])
+    calls = []
+
+    async def fake_upload(**kwargs):
+        calls.append(kwargs)
+
+    fs.client.upload_file_lfs = fake_upload
+
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+
+    fs.put_file(str(local), "group/repo1:-:assays/payload.txt", refresh=True)
+
+    assert len(calls) == 1, "the upload must actually be reached"
+    assert calls[0]["final_path"] == "assays/payload.txt"

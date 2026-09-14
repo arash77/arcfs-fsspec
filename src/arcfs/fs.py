@@ -435,7 +435,7 @@ class GitLabARCFileSystem(AsyncFileSystem):
         Falls back to full async listing and in-memory slicing if backend paging
         cannot be used cleanly.
         """
-        refresh = bool(kwargs.get("refresh", False))
+        refresh = bool(kwargs.pop("refresh", False))
         path = (path or "").strip().strip("/")
 
         if limit <= 0:
@@ -597,7 +597,7 @@ class GitLabARCFileSystem(AsyncFileSystem):
         Returns:
             None.
         """
-        refresh = bool(kwargs.get("refresh", False))
+        refresh = bool(kwargs.pop("refresh", False))
 
         repo, inside = await self._resolve(
             rpath,
