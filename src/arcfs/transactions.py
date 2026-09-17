@@ -114,6 +114,12 @@ async def refuse_a_directory(*, client, repo_id: int, inside: str, ref: str) -> 
             repo_id=repo_id, subdir=inside, ref=ref, page=1, per_page=1
         )
     except FileNotFoundError:
+        # The client reports every 404 from this endpoint the same way, so this cannot tell a
+        # path that is not a directory from a ref or project that is not there. It is safe here
+        # only because of where this runs: the caller creates ``ref`` immediately before, and a
+        # project that has gone missing fails the upload that follows regardless. Moving this
+        # call anywhere earlier brings that ambiguity back and the check starts passing writes
+        # it never managed to make.
         return
     if entries:
         raise IsADirectoryError(inside)
