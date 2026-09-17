@@ -305,6 +305,20 @@ class GitLabARCFileSystem(AsyncFileSystem):
         if self.asynchronous:
             raise RuntimeError("Use open_async() with asynchronous=True filesystems")
 
+        # AsyncLFSFile is an AbstractAsyncStreamedFile, so its write and close are coroutine
+        # functions. Handed back from a synchronous open they are never awaited, so
+        # f.write(data) followed by f.close() returns two coroutines, writes nothing and commits
+        # nothing, and says so nowhere. Losing an upload quietly is worse than refusing one
+        # loudly, so refuse until there is a synchronous writer to hand back.
+        # The test is for write intent rather than the absence of "r", because "r+b" and "rb+"
+        # are read-write and reach the same object.
+        if set(mode) & set("wax+"):
+            raise NotImplementedError(
+                "Writing through a synchronous open() is not supported: the file object it would "
+                "return commits from coroutines that nothing awaits, so the data would be lost "
+                "without an error. Use put_file(), or open_async() on an asynchronous filesystem."
+            )
+
         return asyncio.run(
             self._open_async_lfs_file(
                 path,
