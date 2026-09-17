@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
 from typing import Optional
 import aiofiles
 
@@ -9,7 +8,6 @@ import fsspec
 from fsspec.asyn import AsyncFileSystem, sync
 from .async_lfs_file import AsyncLFSFile
 from .gitlab_client import GitLabClient
-from .transactions import feature_branch_name
 from .utils import norm_inside
 
 
@@ -608,22 +606,6 @@ class GitLabARCFileSystem(AsyncFileSystem):
         if not inside:
             raise IsADirectoryError(rpath)
 
-        # Both the branch the commit lands on and the one it is cut from: an earlier export
-        # with this token may have put the directory on the feature branch only, and a feature
-        # branch that does not exist yet will carry whatever base has.
-        await self._refuse_a_directory(
-            repo["id"],
-            inside,
-            rpath,
-            (
-                kwargs.get("ref"),
-                feature_branch_name(
-                    str(self.client.token or ""),
-                    kwargs.get("feature_branch_prefix", "run_results"),
-                ),
-            ),
-        )
-
         await self.client.upload_file_lfs(
             token=str(self.client.token or ""),
             repo=repo,
@@ -638,56 +620,6 @@ class GitLabARCFileSystem(AsyncFileSystem):
             self._invalidate_after_write(repo=repo, inside_path=inside)
         else:
             self.dircache.clear()
-
-    async def _refuse_a_directory(
-        self,
-        repo_id: int,
-        inside: str,
-        rpath: str,
-        refs: Iterable[Optional[str]],
-    ) -> None:
-        """
-        Refuse a target naming a directory rather than a file inside one.
-
-        Git stores a path as a blob or a tree and a commit may swap one for the
-        other, so writing to a directory replaces that directory and everything
-        under it in a single commit and reports success. The files endpoint
-        cannot catch this: it answers 404 for a directory exactly as it does for
-        a path that is not there.
-
-        The tree endpoint tells them apart, though not the same way on every
-        version: GitLab answers a path that is not a directory with 404 from
-        17.7 on and with an empty list before it, so reading the status alone
-        would refuse every new file on an older self-managed instance. Git has
-        no empty trees, so the entries decide it whichever way the status went.
-
-        Args:
-            repo_id: Numeric GitLab project id.
-            inside: Repository-internal path the write targets.
-            rpath: The path as the caller gave it, for the error message.
-            refs: Branches to check, each ``None`` meaning the default branch. A
-                ref that does not exist answers 404 and is skipped.
-
-        Returns:
-            None.
-
-        Raises:
-            IsADirectoryError: If ``inside`` is a directory on any of ``refs``.
-        """
-        for ref in refs:
-            try:
-                entries, _ = await self.client.retrieve_project_level_page(
-                    repo_id=repo_id,
-                    subdir=inside,
-                    ref=ref,
-                    page=1,
-                    per_page=1,
-                )
-            except FileNotFoundError:
-                continue
-            if entries:
-                raise IsADirectoryError(rpath)
-
 
     # ------------------------------------------------------------------
     # Explicitly disabled destructive operations

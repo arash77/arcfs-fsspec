@@ -76,6 +76,49 @@ async def update_gitattributes(*, client, repo_id: int, branch: str, path_str: s
         await client.create_commit(repo_id, branch, f"Add {ga_path}", actions)
 
 
+async def refuse_a_directory(*, client, repo_id: int, inside: str, ref: str) -> None:
+    """
+    Refuse a write whose target names a directory rather than a file.
+
+    Git stores a path as a blob or a tree and a commit may swap one for the
+    other, so writing to a directory replaces that directory and everything
+    under it and reports success. The files endpoint cannot catch this: it
+    answers 404 for a directory exactly as it does for a path that is not
+    there.
+
+    The tree endpoint tells them apart, though not the same way on every
+    version: GitLab answers a path that is not a directory with 404 from 17.7
+    on and with an empty list before it, so reading the status alone would
+    refuse every new file on an older self-managed instance. Git has no empty
+    trees, so the entries decide it whichever way the status went.
+
+    This lives in the transaction rather than in ``_put_file`` so that every
+    write reaches it. ``open(path, "wb")`` commits through
+    ``AsyncLFSFile._commit``, which calls this function's caller directly and
+    would otherwise skip the check entirely.
+
+    Args:
+        client: GitLab client exposing ``retrieve_project_level_page``.
+        repo_id: Numeric GitLab project id.
+        inside: Repository-internal path the write targets.
+        ref: Branch the write commits to.
+
+    Returns:
+        None.
+
+    Raises:
+        IsADirectoryError: If ``inside`` is a directory on ``ref``.
+    """
+    try:
+        entries, _ = await client.retrieve_project_level_page(
+            repo_id=repo_id, subdir=inside, ref=ref, page=1, per_page=1
+        )
+    except FileNotFoundError:
+        return
+    if entries:
+        raise IsADirectoryError(inside)
+
+
 def feature_branch_name(token: str, prefix: str = "run_results") -> str:
     """
     Return the branch an upload with this token commits onto.
@@ -140,6 +183,12 @@ async def commit_lfs_transaction(
 
     # Create branch; if it exists already, continue on it.
     await client.create_branch(repo_id, feature, base)
+
+    # After the branch exists it carries whatever base had, so one check on it covers both a
+    # directory that was already on base and one an earlier upload put on the feature branch.
+    # Before the LFS upload rather than before the commit, so a refusal leaves no uploaded
+    # object behind with nothing referencing it.
+    await refuse_a_directory(client=client, repo_id=repo_id, inside=final_path, ref=feature)
 
     payload = {
         "operation": "upload",

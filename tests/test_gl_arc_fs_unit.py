@@ -981,123 +981,144 @@ def test_expiry_does_not_reach_the_root_project_index():
 # ----------------------------------------------------------------------
 # Writing to a directory
 # ----------------------------------------------------------------------
-def _put_fs(monkeypatch, tree=None):
-    """Filesystem whose uploads are recorded rather than performed."""
-    fs = _paging_fs(monkeypatch, [])
-    fs.client.tree.update(tree or {})
-    uploads: list[dict] = []
+class TransactionClient:
+    """A client the whole LFS transaction can run against.
 
-    async def fake_upload(**kwargs):
-        uploads.append(kwargs)
-        return "run_results-fake"
+    The guard lives in the transaction, so a fake that replaces upload_file_lfs would never
+    reach it. This one lets the real transaction run and records what it asked for.
+    """
 
-    fs.client.upload_file_lfs = fake_upload
-    return fs, uploads
+    def __init__(self, tree=None):
+        self.token = "token"
+        self.tree = tree or {}
+        self.tree_calls: list[dict] = []
+        self.commits: list[dict] = []
+        self.branches: list[tuple] = []
+        self.merge_requests: list[dict] = []
+        self.uploaded = False
+
+    async def get_default_branch(self, repo_id):
+        return "main"
+
+    async def create_branch(self, repo_id, branch, ref):
+        self.branches.append((repo_id, branch, ref))
+
+    async def retrieve_project_level_page(self, *, repo_id, subdir, ref, page, per_page):
+        self.tree_calls.append({"repo_id": repo_id, "subdir": subdir, "ref": ref})
+        key = (subdir, ref)
+        if key not in self.tree:
+            raise FileNotFoundError(subdir)
+        items = self.tree[key]
+        return items, len(items)
+
+    async def lfs_batch(self, namespace, token, payload):
+        return {"objects": [{"actions": {"upload": {"href": "https://example.invalid/up"}}}]}
+
+    async def lfs_upload(self, token, href, header, stream):
+        self.uploaded = True
+
+    async def get_file(self, repo_id, path, ref):
+        raise FileNotFoundError(path)
+
+    async def create_commit(self, repo_id, branch, message, actions):
+        self.commits.append({"branch": branch, "message": message, "actions": actions})
+        return {}
+
+    async def create_merge_request(self, **kwargs):
+        self.merge_requests.append(kwargs)
 
 
-def test_writing_to_a_directory_on_the_base_branch_is_refused(monkeypatch, tmp_path):
+def _run_transaction(client, final_path="assays", base_branch=None):
+    return asyncio.run(
+        transactions.commit_lfs_transaction(
+            client=client,
+            token=client.token,
+            repo={"id": 1, "original_path": "group/repo1"},
+            base_branch=base_branch,
+            final_path=final_path,
+            sha="a" * 64,
+            size=5,
+            data_stream=io.BytesIO(b"hello"),
+        )
+    )
+
+
+def test_writing_to_a_directory_is_refused():
     """A commit may swap a tree for a blob, so this must not be allowed through.
 
-    Git stores a path as either a tree or a blob and a commit may replace one
-    with the other, so writing to ``assays`` replaces the directory and every
-    file under it. GitLab reports that as success.
-    """
-    fs, uploads = _put_fs(monkeypatch, {(1, "assays"): [{"path": "assays/a.txt", "type": "blob"}]})
-    local = tmp_path / "payload.txt"
-    local.write_bytes(b"hello")
-
-    with pytest.raises(IsADirectoryError):
-        fs.put_file(str(local), "group/repo1:-:assays")
-
-    assert uploads == [], "the guard has to refuse before anything is uploaded"
-
-
-def test_writing_to_a_directory_only_on_the_feature_branch_is_refused(monkeypatch, tmp_path):
-    """The branch that matters is the one the commit lands on.
-
-    Uploads go to a branch named from the token, not to the base branch, and
-    that branch outlives the export. So a directory an earlier export created
-    exists only there, and checking the base branch alone still destroys it.
+    The directory and every file under it would be replaced by the pointer, and GitLab
+    reports that as success.
     """
     feature = feature_branch_name("token")
-    fs, uploads = _put_fs(monkeypatch)
-    # Absent from the base branch: only the feature branch below answers for it.
-    real_page = fs.client.retrieve_project_level_page
-
-    async def branch_aware(*, repo_id, subdir, ref, page, per_page):
-        if subdir == "assays" and ref == feature:
-            return [{"path": "assays/a.txt", "type": "blob"}], 1
-        return await real_page(
-            repo_id=repo_id, subdir=subdir, ref=ref, page=page, per_page=per_page
-        )
-
-    fs.client.retrieve_project_level_page = branch_aware
-
-    local = tmp_path / "payload.txt"
-    local.write_bytes(b"hello")
+    client = TransactionClient({("assays", feature): [{"path": "assays/a.txt", "type": "blob"}]})
 
     with pytest.raises(IsADirectoryError):
-        fs.put_file(str(local), "group/repo1:-:assays")
+        _run_transaction(client)
 
-    assert uploads == []
+    assert client.uploaded is False, "the guard has to refuse before anything is uploaded"
+    assert client.commits == [], "and before anything is committed"
 
 
-def test_writing_a_new_file_is_allowed(monkeypatch, tmp_path):
+def test_the_guard_checks_the_branch_the_commit_lands_on():
+    """Not the branch it is cut from.
+
+    The feature branch is created from base first, so by the time this runs it carries
+    whatever base had. That makes one check cover both a directory already on base and one an
+    earlier upload left on the feature branch, and it cannot disagree with the branch the
+    commit actually uses.
+    """
+    client = TransactionClient()
+    _run_transaction(client, final_path="assays/new.txt")
+
+    feature = feature_branch_name("token")
+    assert client.branches == [(1, feature, "main")], "the branch is created from base first"
+    assert [c["ref"] for c in client.tree_calls] == [feature]
+    assert client.uploaded is True
+
+
+def test_a_new_file_is_allowed():
     """The guard costs a request; it must not cost the ordinary case."""
-    fs, uploads = _put_fs(monkeypatch)
-    local = tmp_path / "payload.txt"
-    local.write_bytes(b"hello")
-
-    fs.put_file(str(local), "group/repo1:-:assays/payload.txt")
-
-    assert len(uploads) == 1
-    assert uploads[0]["final_path"] == "assays/payload.txt"
+    client = TransactionClient()
+    _run_transaction(client, final_path="assays/new.txt")
+    assert client.uploaded is True
+    assert [c["branch"] for c in client.commits], "the pointer must still be committed"
 
 
-def test_writing_a_new_file_is_allowed_when_the_tree_answers_an_empty_list(monkeypatch, tmp_path):
+def test_a_new_file_is_allowed_when_the_tree_answers_an_empty_list():
     """Before GitLab 17.7 a path that is not a directory answered 200 with [].
 
-    A guard reading only the status would take that for a directory and refuse
-    every new file on an older self-managed instance. Git has no empty trees,
-    so the entries are what decide it.
+    A guard reading only the status would refuse every new file on an older self-managed
+    instance. Git has no empty trees, so the entries are what decide it.
     """
-    fs, uploads = _put_fs(monkeypatch)
-
-    async def always_empty(*, repo_id, subdir, ref, page, per_page):
-        return [], 0
-
-    fs.client.retrieve_project_level_page = always_empty
-
-    local = tmp_path / "payload.txt"
-    local.write_bytes(b"hello")
-
-    fs.put_file(str(local), "group/repo1:-:assays/payload.txt")
-
-    assert len(uploads) == 1
+    feature = feature_branch_name("token")
+    client = TransactionClient({("assays/new.txt", feature): []})
+    _run_transaction(client, final_path="assays/new.txt")
+    assert client.uploaded is True
 
 
-def test_the_feature_branch_name_is_the_one_the_upload_uses(monkeypatch, tmp_path):
-    """The guard and the transaction must not be able to disagree on the branch.
+def test_the_open_write_path_is_guarded_too():
+    """open(path, "wb") commits through AsyncLFSFile._commit, not through _put_file.
 
-    They derive it from the same helper, so this pins that they still do.
+    The guard used to sit in _put_file, so this route replaced a directory with a blob and
+    reported success. It reaches the same transaction, so putting the guard there covers it.
     """
-    seen: list[str | None] = []
-    fs, _ = _put_fs(monkeypatch)
-    real_page = fs.client.retrieve_project_level_page
+    feature = feature_branch_name("token")
+    client = TransactionClient({("assays", feature): [{"path": "assays/a.txt", "type": "blob"}]})
 
-    async def record(*, repo_id, subdir, ref, page, per_page):
-        seen.append(ref)
-        return await real_page(
-            repo_id=repo_id, subdir=subdir, ref=ref, page=page, per_page=per_page
+    with pytest.raises(IsADirectoryError):
+        asyncio.run(
+            transactions.commit_lfs_transaction(
+                client=client,
+                token=client.token,
+                repo={"id": 1, "original_path": "group/repo1"},
+                base_branch=None,
+                final_path="assays",
+                sha="b" * 64,
+                size=5,
+                data_stream=io.BytesIO(b"hello"),
+            )
         )
-
-    fs.client.retrieve_project_level_page = record
-
-    local = tmp_path / "payload.txt"
-    local.write_bytes(b"hello")
-    fs.put_file(str(local), "group/repo1:-:assays/payload.txt")
-
-    assert seen == [None, feature_branch_name("token")]
+    assert client.uploaded is False
 
 
 # ----------------------------------------------------------------------
