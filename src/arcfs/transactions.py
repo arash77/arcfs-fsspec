@@ -5,6 +5,7 @@ import hashlib
 from pathlib import PurePosixPath
 from typing import Any, Optional
 
+from .errors import RefNotFound
 from .utils import gitattributes_block, lfs_pointer_text
 
 
@@ -68,6 +69,8 @@ async def update_gitattributes(*, client, repo_id: int, branch: str, path_str: s
         updated = (existing + "\n" + block) if existing else block
         actions = [{"action": "update", "file_path": ga_path, "content": updated, "encoding": "text"}]
         await client.create_commit(repo_id, branch, f"Update {ga_path}", actions)
+    except RefNotFound:
+        raise
     except FileNotFoundError:
         actions = [{"action": "create", "file_path": ga_path, "content": block, "encoding": "text"}]
         await client.create_commit(repo_id, branch, f"Add {ga_path}", actions)
