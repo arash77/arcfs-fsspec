@@ -12,6 +12,7 @@ from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
 from arcfs.errors import RefNotFound
 from arcfs.gitlab_client import GitLabClient
+from arcfs.transactions import feature_branch_name
 
 
 class FakeGitLabClient:
@@ -98,7 +99,12 @@ class FakeGitLabClient:
                 "per_page": per_page,
             }
         )
-        items = self.tree[(repo_id, subdir)]
+        key = (repo_id, subdir)
+        if key not in self.tree:
+            # What the real client does with GitLab's 404, which is also how it
+            # answers a path that is a file rather than a directory.
+            raise FileNotFoundError(f"No such directory in fake tree: {key}")
+        items = self.tree[key]
         start = (page - 1) * per_page
         return items[start:start + per_page], len(items)
 
@@ -970,6 +976,128 @@ def test_expiry_does_not_reach_the_root_project_index():
 
     asyncio.run(fs._ls("", detail=False, refresh=True))
     assert len(fs.client.root_calls) > calls_after_first, "refresh rebuilds the index"
+
+
+# ----------------------------------------------------------------------
+# Writing to a directory
+# ----------------------------------------------------------------------
+def _put_fs(monkeypatch, tree=None):
+    """Filesystem whose uploads are recorded rather than performed."""
+    fs = _paging_fs(monkeypatch, [])
+    fs.client.tree.update(tree or {})
+    uploads: list[dict] = []
+
+    async def fake_upload(**kwargs):
+        uploads.append(kwargs)
+        return "run_results-fake"
+
+    fs.client.upload_file_lfs = fake_upload
+    return fs, uploads
+
+
+def test_writing_to_a_directory_on_the_base_branch_is_refused(monkeypatch, tmp_path):
+    """A commit may swap a tree for a blob, so this must not be allowed through.
+
+    Git stores a path as either a tree or a blob and a commit may replace one
+    with the other, so writing to ``assays`` replaces the directory and every
+    file under it. GitLab reports that as success.
+    """
+    fs, uploads = _put_fs(monkeypatch, {(1, "assays"): [{"path": "assays/a.txt", "type": "blob"}]})
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+
+    with pytest.raises(IsADirectoryError):
+        fs.put_file(str(local), "group/repo1:-:assays")
+
+    assert uploads == [], "the guard has to refuse before anything is uploaded"
+
+
+def test_writing_to_a_directory_only_on_the_feature_branch_is_refused(monkeypatch, tmp_path):
+    """The branch that matters is the one the commit lands on.
+
+    Uploads go to a branch named from the token, not to the base branch, and
+    that branch outlives the export. So a directory an earlier export created
+    exists only there, and checking the base branch alone still destroys it.
+    """
+    feature = feature_branch_name("token")
+    fs, uploads = _put_fs(monkeypatch)
+    # Absent from the base branch: only the feature branch below answers for it.
+    real_page = fs.client.retrieve_project_level_page
+
+    async def branch_aware(*, repo_id, subdir, ref, page, per_page):
+        if subdir == "assays" and ref == feature:
+            return [{"path": "assays/a.txt", "type": "blob"}], 1
+        return await real_page(
+            repo_id=repo_id, subdir=subdir, ref=ref, page=page, per_page=per_page
+        )
+
+    fs.client.retrieve_project_level_page = branch_aware
+
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+
+    with pytest.raises(IsADirectoryError):
+        fs.put_file(str(local), "group/repo1:-:assays")
+
+    assert uploads == []
+
+
+def test_writing_a_new_file_is_allowed(monkeypatch, tmp_path):
+    """The guard costs a request; it must not cost the ordinary case."""
+    fs, uploads = _put_fs(monkeypatch)
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+
+    fs.put_file(str(local), "group/repo1:-:assays/payload.txt")
+
+    assert len(uploads) == 1
+    assert uploads[0]["final_path"] == "assays/payload.txt"
+
+
+def test_writing_a_new_file_is_allowed_when_the_tree_answers_an_empty_list(monkeypatch, tmp_path):
+    """Before GitLab 17.7 a path that is not a directory answered 200 with [].
+
+    A guard reading only the status would take that for a directory and refuse
+    every new file on an older self-managed instance. Git has no empty trees,
+    so the entries are what decide it.
+    """
+    fs, uploads = _put_fs(monkeypatch)
+
+    async def always_empty(*, repo_id, subdir, ref, page, per_page):
+        return [], 0
+
+    fs.client.retrieve_project_level_page = always_empty
+
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+
+    fs.put_file(str(local), "group/repo1:-:assays/payload.txt")
+
+    assert len(uploads) == 1
+
+
+def test_the_feature_branch_name_is_the_one_the_upload_uses(monkeypatch, tmp_path):
+    """The guard and the transaction must not be able to disagree on the branch.
+
+    They derive it from the same helper, so this pins that they still do.
+    """
+    seen: list[str | None] = []
+    fs, _ = _put_fs(monkeypatch)
+    real_page = fs.client.retrieve_project_level_page
+
+    async def record(*, repo_id, subdir, ref, page, per_page):
+        seen.append(ref)
+        return await real_page(
+            repo_id=repo_id, subdir=subdir, ref=ref, page=page, per_page=per_page
+        )
+
+    fs.client.retrieve_project_level_page = record
+
+    local = tmp_path / "payload.txt"
+    local.write_bytes(b"hello")
+    fs.put_file(str(local), "group/repo1:-:assays/payload.txt")
+
+    assert seen == [None, feature_branch_name("token")]
 
 
 # ----------------------------------------------------------------------

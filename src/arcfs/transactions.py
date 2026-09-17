@@ -76,6 +76,26 @@ async def update_gitattributes(*, client, repo_id: int, branch: str, path_str: s
         await client.create_commit(repo_id, branch, f"Add {ga_path}", actions)
 
 
+def feature_branch_name(token: str, prefix: str = "run_results") -> str:
+    """
+    Return the branch an upload with this token commits onto.
+
+    The name is derived from the token rather than from the file, so every export
+    made with one token shares a branch and sees what the earlier ones left there.
+    A caller has to be able to work out that branch before the upload starts, which
+    is why this is not inlined in ``commit_lfs_transaction``.
+
+    Args:
+        token: Token the upload authenticates with.
+        prefix: Prefix for the generated branch name.
+
+    Returns:
+        Branch name as ``str``.
+    """
+    token_sha = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+    return f"{prefix}-{token_sha}"
+
+
 async def commit_lfs_transaction(
     *,
     client,
@@ -116,8 +136,7 @@ async def commit_lfs_transaction(
     namespace = repo["original_path"]  # project path_with_namespace
     base = base_branch or await client.get_default_branch(repo_id)
 
-    token_sha = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
-    feature = f"{feature_branch_prefix}-{token_sha}"
+    feature = feature_branch_name(token, feature_branch_prefix)
 
     # Create branch; if it exists already, continue on it.
     await client.create_branch(repo_id, feature, base)
